@@ -1,16 +1,19 @@
-import numpy as np
+import asyncio
+import json
+import threading
+import time
+from datetime import datetime, timezone
+
 import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
-import yfinance as yf
+import websockets
 
 st.set_page_config(
-    page_title="كاشف سيولة الحيتان - العقود الآجلة",
+    page_title="راصد حيتان الفيوتشر المباشر",
     page_icon="🐋",
     layout="wide",
 )
 
-# --- تنسيق RTL وتحسين العرض على الجوال ---
 st.markdown("""
 <style>
     .stApp, .stMarkdown, .stSelectbox, .stSlider, .stNumberInput, .stTextInput {
@@ -26,255 +29,151 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🐋 أداة رصد السيولة وحساب الأهداف ووقف الخسارة (العقود الآجلة)")
+st.title("🐋 راصد صفقات الحيتان والتصفيات الحقيقية (Futures)")
 st.caption(
-    "تنبيه: هذه الأداة تحليلية لمساعدتك في رصد قفزات الحجم وبناء إدارة المخاطر؛ وليست توصية استثمارية أو ضماناً للربح."
+    "بث مباشر لصفقات التنفيذ الكبيرة (aggTrade) والتصفيات (forceOrder) في عقود الفيوتشر — "
+    "الأداة لرصد السيولة وإدارة المخاطر وليست توصية أو ضماناً للربح."
 )
 
-# --- الشريط الجانبي: البحث والإعدادات ---
-st.sidebar.header("⚙️ إعدادات الفحص والبحث")
-
-st.sidebar.subheader("🔎 البحث عن عملة أو رمز")
-quick_picks = {
-    "بحث حر (اكتب أي عملة بالأسفل)": "",
-    "بيتكوين (BTC-USD)": "BTC-USD",
-    "إيثيريوم (ETH-USD)": "ETH-USD",
-    "سولانا (SOL-USD)": "SOL-USD",
-    "ريبل (XRP-USD)": "XRP-USD",
-    "عقود S&P 500 الآجلة (ES=F)": "ES=F",
-    "عقود Nasdaq الآجلة (NQ=F)": "NQ=F",
-    "الذهب الآجل (GC=F)": "GC=F",
-    "النفط الخام الآجل (CL=F)": "CL=F",
-}
-
-selected_quick = st.sidebar.selectbox("اختيار سريع (اختياري)", list(quick_picks.keys()))
-default_symbol = quick_picks[selected_quick] if quick_picks[selected_quick] else "BTC-USD"
-
-raw_query = st.sidebar.text_input(
-    "اكتب رمز العملة أو الزوج للبحث",
-    value=default_symbol,
-    placeholder="مثال: SOL أو AVAX-USD أو EURUSD=X",
-    help="للعملات الرقمية في Yahoo Finance يمكن كتابة الرمز مثل SOL أو بصيغة SOL-USD"
-).strip().upper()
-
-# تنسيق تلقائي إذا كتب المستخدم رمز عملة رقمية بدون لاحقة مثل BTC أو SOL
-if raw_query and "-" not in raw_query and "=" not in raw_query and not raw_query.endswith("USD"):
-    symbol = f"{raw_query}-USD"
-else:
-    symbol = raw_query or "BTC-USD"
-
-st.sidebar.caption(f"الرمز الفعلي قيد الفحص: `{symbol}`")
-
-interval = st.sidebar.selectbox("الفاصل الزمني", ["15m", "1h", "4h", "1d"], index=1)
-period = st.sidebar.selectbox("فترة البيانات التاريخية", ["5d", "1mo", "3mo", "6mo", "1y"], index=1)
-
-st.sidebar.subheader("🎯 معايير رصد صفقات الحيتان")
-vol_multiplier = st.sidebar.slider("مضاعف قفزة الحجم (مقارنة بالمتوسط)", 1.5, 5.0, 2.2, 0.1)
-vol_window = st.sidebar.slider("نافذة متوسط الحجم (عدد الشموع)", 10, 50, 20, 1)
-
-st.sidebar.subheader("🛡️ إدارة المخاطر والوقف والأهداف")
-atr_period = st.sidebar.slider("فترة مؤشر ATR", 7, 28, 14, 1)
-sl_atr_mult = st.sidebar.slider("مضاعف وقف الخسارة (× ATR)", 0.5, 3.0, 1.5, 0.1)
-tp1_rr = st.sidebar.slider("نسبة العائد للهدف الأول (R:R)", 1.0, 3.0, 1.5, 0.1)
-tp2_rr = st.sidebar.slider("نسبة العائد للهدف الثاني (R:R)", 2.0, 6.0, 3.0, 0.2)
-account_size = st.sidebar.number_input("رأس المال ($)", min_value=100.0, value=10000.0, step=500.0)
-risk_pct = st.sidebar.slider("نسبة المخاطرة في الصفقة (%)", 0.25, 5.0, 1.0, 0.25)
-
-use_demo = st.sidebar.checkbox("استخدام بيانات تجريبية إذا تعذر الاتصال بالبيانات الحية", value=True)
+# --- تهيئة الحالة العامة ---
+if "events" not in st.session_state:
+    st.session_state.events = []
+if "worker_thread" not in st.session_state:
+    st.session_state.worker_thread = None
+if "stop_event" not in st.session_state:
+    st.session_state.stop_event = None
+if "active_symbol" not in st.session_state:
+    st.session_state.active_symbol = ""
 
 
-def generate_demo_data(n=200, seed=42):
-    rng = np.random.default_rng(seed)
-    dates = pd.date_range(end=pd.Timestamp.now(), periods=n, freq="h")
-    close = 2650.0 + np.cumsum(rng.normal(0, 8, size=n))
-    high = close + rng.uniform(2, 14, size=n)
-    low = close - rng.uniform(2, 14, size=n)
-    open_p = np.roll(close, 1)
-    open_p[0] = close[0]
-    volume = rng.integers(800, 3500, size=n).astype(float)
+def ws_listener(symbol: str, min_trade_usd: float, min_liq_usd: float, events_buffer: list, stop_flag: threading.Event):
+    sym = symbol.lower()
+    url = f"wss://fstream.binance.com/stream?streams={sym}@aggTrade/{sym}@forceOrder"
 
-    for idx in [45, 92, 148, 185]:
-        if idx < n:
-            direction = 1 if idx % 2 == 0 else -1
-            volume[idx] = rng.uniform(7500, 14000)
-            close[idx] = open_p[idx] + direction * rng.uniform(12, 26)
-            high[idx] = max(open_p[idx], close[idx]) + rng.uniform(2, 8)
-            low[idx] = min(open_p[idx], close[idx]) - rng.uniform(2, 8)
+    async def runner():
+        while not stop_flag.is_set():
+            try:
+                async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
+                    while not stop_flag.is_set():
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                        except asyncio.TimeoutError:
+                            continue
 
-    df = pd.DataFrame({
-        "Open": open_p,
-        "High": high,
-        "Low": low,
-        "Close": close,
-        "Volume": volume,
-    }, index=dates)
-    return df
+                        payload = json.loads(raw)
+                        stream = payload.get("stream", "")
+                        data = payload.get("data", {})
+                        now_str = datetime.now(timezone.utc).strftime("%H:%M:%S")
+
+                        if stream.endswith("@aggTrade"):
+                            price = float(data["p"])
+                            qty = float(data["q"])
+                            usd_val = price * qty
+                            if usd_val >= min_trade_usd:
+                                side = "بيع هجومي (Sell)" if data["m"] else "شراء هجومي (Buy)"
+                                events_buffer.append({
+                                    "الوقت (UTC)": now_str,
+                                    "النوع": "صفقة حوت",
+                                    "الاتجاه": side,
+                                    "السعر": round(price, 4),
+                                    "الكمية": round(qty, 4),
+                                    "القيمة ($)": round(usd_val, 0),
+                                })
+                                del events_buffer[:-200]
+
+                        elif stream.endswith("@forceOrder"):
+                            order = data.get("o", {})
+                            price = float(order.get("p", 0))
+                            qty = float(order.get("q", 0))
+                            usd_val = price * qty
+                            if usd_val >= min_liq_usd:
+                                liq_side = "تصفية لونغ (Long)" if order.get("S") == "SELL" else "تصفية شورت (Short)"
+                                events_buffer.append({
+                                    "الوقت (UTC)": now_str,
+                                    "النوع": "تصفية كبيرة",
+                                    "الاتجاه": liq_side,
+                                    "السعر": round(price, 4),
+                                    "الكمية": round(qty, 4),
+                                    "القيمة ($)": round(usd_val, 0),
+                                })
+                                del events_buffer[:-200]
+            except Exception:
+                if not stop_flag.is_set():
+                    time.sleep(2)
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(runner())
+    finally:
+        loop.close()
 
 
-@st.cache_data(ttl=120)
-def load_market_data(sym: str, per: str, inter: str):
-    df = yf.download(sym, period=per, interval=inter, progress=False, auto_adjust=False)
-    if df is None or df.empty:
-        return pd.DataFrame()
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
-    return df
+# --- الشريط الجانبي ---
+st.sidebar.header("⚙️ إعدادات البث المباشر")
+symbol_input = st.sidebar.text_input("رمز العملة في الفيوتشر", value="BTCUSDT").strip().upper()
+min_trade_usd = st.sidebar.number_input("حد الصفقة الكبيرة ($)", min_value=10000.0, value=250000.0, step=25000.0)
+min_liq_usd = st.sidebar.number_input("حد التصفية الكبيرة ($)", min_value=10000.0, value=100000.0, step=25000.0)
 
+st.sidebar.subheader("🛡️ حاسبة إدارة المخاطر السريعة")
+entry_price = st.sidebar.number_input("سعر الدخول المقترح", min_value=0.0001, value=90000.0, step=100.0, format="%.4f")
+stop_price = st.sidebar.number_input("سعر وقف الخسارة (SL)", min_value=0.0001, value=89100.0, step=100.0, format="%.4f")
+tp1_price = st.sidebar.number_input("الهدف الأول (TP1)", min_value=0.0001, value=91800.0, step=100.0, format="%.4f")
+tp2_price = st.sidebar.number_input("الهدف الثاني (TP2)", min_value=0.0001, value=93600.0, step=100.0, format="%.4f")
+balance = st.sidebar.number_input("الرصيد ($)", min_value=10.0, value=1000.0, step=100.0)
+risk_pct = st.sidebar.slider("مخاطرة الصفقة (%)", 0.25, 5.0, 1.0, 0.25)
 
-def analyze_whales(df: pd.DataFrame):
-    data = df.copy()
-    data["Vol_SMA"] = data["Volume"].rolling(vol_window).mean()
-    data["Vol_Ratio"] = data["Volume"] / data["Vol_SMA"].replace(0, np.nan)
+col_btn1, col_btn2, col_btn3 = st.columns(3)
+start_clicked = col_btn1.button("▶️ تشغيل البث الحقيقي", use_container_width=True)
+stop_clicked = col_btn2.button("⏹️ إيقاف البث", use_container_width=True)
+clear_clicked = col_btn3.button("🗑️ مسح السجل", use_container_width=True)
 
-    prev_close = data["Close"].shift(1)
-    tr = pd.concat([
-        data["High"] - data["Low"],
-        (data["High"] - prev_close).abs(),
-        (data["Low"] - prev_close).abs(),
-    ], axis=1).max(axis=1)
-    data["ATR"] = tr.rolling(atr_period).mean()
+if clear_clicked:
+    st.session_state.events.clear()
 
-    data["Direction"] = np.where(
-        data["Close"] > data["Open"], "شراء (Long)",
-        np.where(data["Close"] < data["Open"], "بيع (Short)", "محايد")
+if stop_clicked and st.session_state.stop_event is not None:
+    st.session_state.stop_event.set()
+    st.session_state.worker_thread = None
+
+if start_clicked:
+    if st.session_state.stop_event is not None:
+        st.session_state.stop_event.set()
+    stop_flag = threading.Event()
+    st.session_state.stop_event = stop_flag
+    st.session_state.active_symbol = symbol_input
+    t = threading.Thread(
+        target=ws_listener,
+        args=(symbol_input, min_trade_usd, min_liq_usd, st.session_state.events, stop_flag),
+        daemon=True,
     )
+    t.start()
+    st.session_state.worker_thread = t
 
-    data["Whale_Signal"] = (
-        (data["Vol_Ratio"] >= vol_multiplier)
-        & (data["Direction"] != "محايد")
-        & data["ATR"].notna()
-    )
-
-    risk_dist = data["ATR"] * sl_atr_mult
-    data["Entry"] = data["Close"]
-
-    data["Stop_Loss"] = np.where(
-        data["Direction"] == "شراء (Long)",
-        data["Entry"] - risk_dist,
-        np.where(data["Direction"] == "بيع (Short)", data["Entry"] + risk_dist, np.nan)
-    )
-
-    data["TP1"] = np.where(
-        data["Direction"] == "شراء (Long)",
-        data["Entry"] + (risk_dist * tp1_rr),
-        np.where(data["Direction"] == "بيع (Short)", data["Entry"] - (risk_dist * tp1_rr), np.nan)
-    )
-
-    data["TP2"] = np.where(
-        data["Direction"] == "شراء (Long)",
-        data["Entry"] + (risk_dist * tp2_rr),
-        np.where(data["Direction"] == "بيع (Short)", data["Entry"] - (risk_dist * tp2_rr), np.nan)
-    )
-
-    data["Risk_Per_Unit"] = (data["Entry"] - data["Stop_Loss"]).abs()
-    max_loss_dollars = account_size * (risk_pct / 100.0)
-    data["Suggested_Units"] = np.where(
-        data["Risk_Per_Unit"] > 0,
-        max_loss_dollars / data["Risk_Per_Unit"],
-        0.0
-    )
-
-    return data.dropna(subset=["ATR", "Vol_SMA"])
-
-
-raw_df = load_market_data(symbol, period, interval)
-source_label = "بيانات السوق (Yahoo Finance)"
-
-if raw_df.empty:
-    if use_demo:
-        raw_df = generate_demo_data()
-        source_label = "بيانات تجريبية (Demo)"
-    else:
-        st.error(f"تعذر جلب البيانات للرمز `{symbol}`. جرّب رمزاً آخر أو فعّل البيانات التجريبية من الشريط الجانبي.")
-        st.stop()
-
-df_analyzed = analyze_whales(raw_df)
-signals = df_analyzed[df_analyzed["Whale_Signal"]].copy()
-
+is_running = st.session_state.worker_thread is not None and st.session_state.worker_thread.is_alive()
 st.info(
-    f"الرمز: **`{symbol}`** | المصدر: **{source_label}** | "
-    f"الشموع المحللة: **{len(df_analyzed)}** | إشارات الحيتان: **{len(signals)}**"
+    f"حالة البث: **{'🟢 متصل (' + st.session_state.active_symbol + ')' if is_running else '⚪ متوقف'}** | "
+    f"عدد الأحداث الملتقطة: **{len(st.session_state.events)}**"
 )
 
-# --- عرض أحدث إشارة حوت ---
-if not signals.empty:
-    latest = signals.iloc[-1]
-    st.subheader("📌 أحدث إشارة مرصودة ومستويات المخاطرة والأهداف")
+# --- ملخص إدارة المخاطر ---
+risk_dist = abs(entry_price - stop_price)
+max_loss = balance * (risk_pct / 100.0)
+pos_size = (max_loss / risk_dist) if risk_dist > 0 else 0.0
 
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("نوع الإشارة", str(latest["Direction"]))
-    c2.metric("سعر الدخول التقريبي", f"{latest['Entry']:.4f}")
-    c3.metric("وقف الخسارة (SL)", f"{latest['Stop_Loss']:.4f}")
-    c4.metric(f"الهدف الأول (TP1 - {tp1_rr}R)", f"{latest['TP1']:.4f}")
-    c5.metric(f"الهدف الثاني (TP2 - {tp2_rr}R)", f"{latest['TP2']:.4f}")
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("الحد الأقصى للخسارة", f"${max_loss:,.2f}")
+m2.metric("حجم المركز التقديري", f"{pos_size:.4f}")
+m3.metric("مسافة الوقف", f"{risk_dist:.4f}")
+m4.metric("الهدف 1 / الهدف 2", f"{tp1_price:.4f} / {tp2_price:.4f}")
 
-    risk_amount = account_size * (risk_pct / 100.0)
-    st.markdown(
-        f"- **مضاعف الحجم:** `{latest['Vol_Ratio']:.2f}x` من متوسط آخر `{vol_window}` شموع\n"
-        f"- **قيمة ATR الحالية:** `{latest['ATR']:.4f}` | **مسافة الوقف:** `{latest['Risk_Per_Unit']:.4f}`\n"
-        f"- **الحد الأقصى للمخاطرة في الصفقة:** `${risk_amount:,.2f}` | **حجم الوحدات/العقود التقديري:** `{latest['Suggested_Units']:.2f}`"
-    )
+# --- عرض الصفقات والتصفيات الحقيقية ---
+if st.session_state.events:
+    df_ev = pd.DataFrame(st.session_state.events).iloc[::-1]
+    st.dataframe(df_ev, use_container_width=True, hide_index=True)
 else:
-    st.warning("لم يتم رصد إشارات حيتان بالمعايير الحالية. حاول خفض (مضاعف قفزة الحجم) أو تغيير الفاصل الزمني.")
+    st.warning("اضغط على (تشغيل البث الحقيقي) وانتظر وصول صفقات أو تصفيات تتجاوز الحد المحدد بالدولار.")
 
-# --- الرسم البياني التفاعلي ---
-st.subheader("📈 الرسم البياني وإشارات الحجم")
-
-fig = go.Figure()
-
-fig.add_trace(go.Candlestick(
-    x=df_analyzed.index,
-    open=df_analyzed["Open"],
-    high=df_analyzed["High"],
-    low=df_analyzed["Low"],
-    close=df_analyzed["Close"],
-    name="السعر"
-))
-
-if not signals.empty:
-    long_sig = signals[signals["Direction"] == "شراء (Long)"]
-    short_sig = signals[signals["Direction"] == "بيع (Short)"]
-
-    fig.add_trace(go.Scatter(
-        x=long_sig.index,
-        y=long_sig["Low"] * 0.998,
-        mode="markers",
-        marker=dict(symbol="triangle-up", size=12, color="green"),
-        name="إشارة شراء (حجم مرتفع)"
-    ))
-
-    fig.add_trace(go.Scatter(
-        x=short_sig.index,
-        y=short_sig["High"] * 1.002,
-        mode="markers",
-        marker=dict(symbol="triangle-down", size=12, color="red"),
-        name="إشارة بيع (حجم مرتفع)"
-    ))
-
-    last_row = signals.iloc[-1]
-    fig.add_hline(y=last_row["Stop_Loss"], line_dash="dash", line_color="red", annotation_text="SL")
-    fig.add_hline(y=last_row["TP1"], line_dash="dot", line_color="green", annotation_text="TP1")
-    fig.add_hline(y=last_row["TP2"], line_dash="dot", line_color="blue", annotation_text="TP2")
-
-fig.update_layout(
-    height=520,
-    xaxis_rangeslider_visible=False,
-    template="plotly_dark"
-)
-st.plotly_chart(fig, use_container_width=True)
-
-# --- جدول الإشارات التاريخية ---
-if not signals.empty:
-    st.subheader("📋 سجل الإشارات المرصودة")
-    table_df = pd.DataFrame({
-        "الوقت": signals.index.strftime("%Y-%m-%d %H:%M"),
-        "الاتجاه": signals["Direction"].values,
-        "مضاعف الحجم": signals["Vol_Ratio"].round(2).values,
-        "الدخول": signals["Entry"].round(4).values,
-        "وقف الخسارة": signals["Stop_Loss"].round(4).values,
-        "الهدف 1": signals["TP1"].round(4).values,
-        "الهدف 2": signals["TP2"].round(4).values,
-        "حجم مقترح": signals["Suggested_Units"].round(2).values,
-    })
-    st.dataframe(table_df.iloc[::-1], use_container_width=True, hide_index=True)
+auto_refresh = st.checkbox("تحديث تلقائي للواجهة كل ثانيتين أثناء البث", value=True)
+if is_running and auto_refresh:
+    time.sleep(2)
+    st.rerun()
