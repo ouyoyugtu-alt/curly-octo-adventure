@@ -1,296 +1,696 @@
-import numpy as np
-import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
-import yfinance as yf
+import pandas as pd
+import numpy as np
+import requests
+import plotly.graph_objects as go
+
+from datetime import datetime
+
+# =====================================
+# GALEIC FUTURES PRO
+# Binance USDT-M Futures Analyzer
+# =====================================
+
+API = "https://fapi.binance.com"
 
 st.set_page_config(
-    page_title="فلتر إشارات 1h بـ 4h - العقود الآجلة",
-    page_icon="📊",
-    layout="wide",
+    page_title="GALEIC FUTURES PRO",
+    page_icon="🚀",
+    layout="wide"
 )
 
-# --- تنسيق RTL وتحسين العرض على الجوال ---
 st.markdown("""
 <style>
-    .stApp, .stMarkdown, .stSelectbox, .stSlider, .stNumberInput, .stTextInput {
-        direction: rtl;
-        text-align: right;
-    }
-    @media (max-width: 768px) {
-        [data-testid="stSidebar"] {
-            width: 85vw !important;
-            min-width: 85vw !important;
-        }
-    }
+.stApp {
+    background: #080d18;
+    color: white;
+    direction: rtl;
+}
+section[data-testid="stSidebar"] {
+    background: #101827;
+}
+.metric-box {
+    background: #111c2e;
+    padding: 18px;
+    border-radius: 12px;
+    border: 1px solid #263650;
+    text-align: center;
+}
 </style>
 """, unsafe_allow_html=True)
 
-st.title("📊 فلتر إشارات فريم 1 ساعة بناءً على فريم 4 ساعات")
-st.caption(
-    "فريم 4h يحدد الاتجاه العام عبر EMA، وفريم 1h يولّد الإشارة ويحسب الوقف والأهداف عبر ATR — "
-    "أداة تحليلية لإدارة المخاطر وليست توصية أو ضماناً للربح."
-)
+st.title("🚀 GALEIC FUTURES PRO")
+st.caption("Advanced Binance Futures Analysis System")
 
-# --- الشريط الجانبي: البحث والإعدادات ---
-st.sidebar.header("⚙️ البحث والإعدادات")
+# =====================================
+# API FUNCTIONS
+# =====================================
 
-quick_picks = {
-    "بحث حر (اكتب أي رمز بالأسفل)": "",
-    "بيتكوين (BTC-USD)": "BTC-USD",
-    "إيثيريوم (ETH-USD)": "ETH-USD",
-    "سولانا (SOL-USD)": "SOL-USD",
-    "الذهب الآجل (GC=F)": "GC=F",
-    "النفط الخام الآجل (CL=F)": "CL=F",
-    "عقود S&P 500 الآجلة (ES=F)": "ES=F",
-}
-
-selected_quick = st.sidebar.selectbox("اختيار سريع", list(quick_picks.keys()))
-default_sym = quick_picks[selected_quick] if quick_picks[selected_quick] else "BTC-USD"
-
-raw_query = st.sidebar.text_input(
-    "ابحث عن عملة أو رمز",
-    value=default_sym,
-    placeholder="مثال: BTC أو SOL-USD أو GC=F",
-).strip().upper()
-
-if raw_query and "-" not in raw_query and "=" not in raw_query and not raw_query.endswith("USD"):
-    symbol = f"{raw_query}-USD"
-else:
-    symbol = raw_query or "BTC-USD"
-
-st.sidebar.caption(f"الرمز الفعلي: `{symbol}`")
-
-period = st.sidebar.selectbox("فترة البيانات التاريخية", ["1mo", "3mo", "6mo", "1y"], index=1)
-
-st.sidebar.subheader("🧭 إعدادات فلتر 4h و1h")
-ema_4h_period = st.sidebar.slider("فترة EMA على فريم 4h", 10, 100, 20, 1)
-breakout_lookback = st.sidebar.slider("عدد شموع القمة/القاع للكسر على 1h", 2, 10, 3, 1)
-
-st.sidebar.subheader("🛡️ وقف الخسارة والأهداف وإدارة المخاطر")
-atr_1h_period = st.sidebar.slider("فترة ATR على فريم 1h", 7, 28, 14, 1)
-sl_atr_mult = st.sidebar.slider("مضاعف وقف الخسارة (× ATR)", 0.5, 3.0, 1.5, 0.1)
-tp1_rr = st.sidebar.slider("نسبة الهدف الأول (TP1 R:R)", 1.0, 3.0, 1.5, 0.1)
-tp2_rr = st.sidebar.slider("نسبة الهدف الثاني (TP2 R:R)", 2.0, 6.0, 3.0, 0.2)
-account_size = st.sidebar.number_input("رأس المال ($)", min_value=100.0, value=10000.0, step=500.0)
-risk_pct = st.sidebar.slider("مخاطرة الصفقة (%)", 0.25, 5.0, 1.0, 0.25)
-
-use_demo = st.sidebar.checkbox("استخدام بيانات تجريبية إذا لم تتوفر بيانات حية", value=True)
+@st.cache_data(ttl=15)
+def get_server_time():
+    r = requests.get(API + "/fapi/v1/time", timeout=10)
+    r.raise_for_status()
+    return r.json()["serverTime"]
 
 
-def generate_demo_1h(n=480, seed=42):
-    rng = np.random.default_rng(seed)
-    dates = pd.date_range(end=pd.Timestamp.now(), periods=n, freq="h")
-    close = 61000.0 + np.cumsum(rng.normal(0, 280, size=n))
-    high = close + rng.uniform(80, 420, size=n)
-    low = close - rng.uniform(80, 420, size=n)
-    open_p = np.roll(close, 1)
-    open_p[0] = close[0]
-    volume = rng.integers(500, 3000, size=n).astype(float)
-    return pd.DataFrame({
-        "Open": open_p,
-        "High": high,
-        "Low": low,
-        "Close": close,
-        "Volume": volume,
-    }, index=dates)
+@st.cache_data(ttl=60)
+def get_symbols():
+
+    r = requests.get(
+        API + "/fapi/v1/exchangeInfo",
+        timeout=15
+    )
+
+    r.raise_for_status()
+
+    data = r.json()
+
+    return [
+        x["symbol"]
+        for x in data["symbols"]
+        if x["quoteAsset"] == "USDT"
+        and x["contractType"] == "PERPETUAL"
+        and x["status"] == "TRADING"
+    ]
 
 
-@st.cache_data(ttl=120)
-def load_1h_data(sym: str, per: str):
-    df = yf.download(sym, period=per, interval="1h", progress=False, auto_adjust=False)
-    if df is None or df.empty:
-        return pd.DataFrame()
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    df = df[["Open", "High", "Low", "Close", "Volume"]].dropna().sort_index()
-    if getattr(df.index, "tz", None) is not None:
-        df.index = df.index.tz_convert(None)
+@st.cache_data(ttl=15)
+def get_tickers():
+
+    r = requests.get(
+        API + "/fapi/v1/ticker/24hr",
+        timeout=15
+    )
+
+    r.raise_for_status()
+
+    return pd.DataFrame(r.json())
+
+
+@st.cache_data(ttl=20)
+def get_klines(symbol, interval, limit=300):
+
+    r = requests.get(
+        API + "/fapi/v1/klines",
+        params={
+            "symbol": symbol,
+            "interval": interval,
+            "limit": limit
+        },
+        timeout=15
+    )
+
+    r.raise_for_status()
+
+    data = r.json()
+
+    columns = [
+        "time", "Open", "High", "Low",
+        "Close", "Volume", "close_time",
+        "quote_volume", "trades",
+        "taker_buy_volume",
+        "taker_buy_quote", "ignore"
+    ]
+
+    df = pd.DataFrame(data, columns=columns)
+
+    for col in [
+        "Open", "High", "Low",
+        "Close", "Volume"
+    ]:
+        df[col] = pd.to_numeric(df[col])
+
+    df["time"] = pd.to_datetime(
+        df["time"], unit="ms"
+    )
+
+    # حذف الشمعة التي لم تغلق بعد
+    server_time = get_server_time()
+
+    df = df[
+        df["close_time"].astype("int64")
+        < server_time
+    ].copy()
+
+    df.set_index("time", inplace=True)
+
     return df
 
 
-def build_4h_from_1h(df_1h: pd.DataFrame) -> pd.DataFrame:
-    agg = {
-        "Open": "first",
-        "High": "max",
-        "Low": "min",
-        "Close": "last",
-        "Volume": "sum",
-    }
-    df_4h = df_1h.resample("4h", label="left", closed="left").agg(agg).dropna()
-    return df_4h
+# =====================================
+# INDICATORS
+# =====================================
 
+def indicators(df):
 
-def filter_1h_with_4h(df_1h: pd.DataFrame, df_4h: pd.DataFrame) -> pd.DataFrame:
-    d1 = df_1h.copy().sort_index()
-    d4 = df_4h.copy().sort_index()
+    d = df.copy()
 
-    d4["EMA_4H"] = d4["Close"].ewm(span=ema_4h_period, adjust=False).mean()
-    d4["Trend_4H"] = np.where(
-        d4["Close"] > d4["EMA_4H"], "BULLISH",
-        np.where(d4["Close"] < d4["EMA_4H"], "BEARISH", "NEUTRAL")
-    )
+    d["EMA20"] = d.Close.ewm(
+        span=20, adjust=False
+    ).mean()
 
-    d1 = pd.merge_asof(
-        d1,
-        d4[["EMA_4H", "Trend_4H"]],
-        left_index=True,
-        right_index=True,
-        direction="backward",
-    )
+    d["EMA50"] = d.Close.ewm(
+        span=50, adjust=False
+    ).mean()
 
-    prev_close = d1["Close"].shift(1)
+    d["EMA200"] = d.Close.ewm(
+        span=200, adjust=False
+    ).mean()
+
+    delta = d.Close.diff()
+
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.ewm(
+        alpha=1/14, adjust=False
+    ).mean()
+
+    avg_loss = loss.ewm(
+        alpha=1/14, adjust=False
+    ).mean()
+
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+
+    d["RSI"] = 100 - (100 / (1 + rs))
+
+    ema12 = d.Close.ewm(
+        span=12, adjust=False
+    ).mean()
+
+    ema26 = d.Close.ewm(
+        span=26, adjust=False
+    ).mean()
+
+    d["MACD"] = ema12 - ema26
+
+    d["MACD_SIGNAL"] = d.MACD.ewm(
+        span=9, adjust=False
+    ).mean()
+
+    prev = d.Close.shift(1)
+
     tr = pd.concat([
-        d1["High"] - d1["Low"],
-        (d1["High"] - prev_close).abs(),
-        (d1["Low"] - prev_close).abs(),
+        d.High - d.Low,
+        (d.High - prev).abs(),
+        (d.Low - prev).abs()
     ], axis=1).max(axis=1)
-    d1["ATR_1H"] = tr.rolling(atr_1h_period).mean()
 
-    prev_high = d1["High"].shift(1).rolling(breakout_lookback).max()
-    prev_low = d1["Low"].shift(1).rolling(breakout_lookback).min()
+    d["ATR"] = tr.ewm(
+        alpha=1/14, adjust=False
+    ).mean()
 
-    raw_long_1h = (d1["Close"] > d1["Open"]) & (d1["Close"] > prev_high)
-    raw_short_1h = (d1["Close"] < d1["Open"]) & (d1["Close"] < prev_low)
+    d["VOL_MA"] = d.Volume.rolling(20).mean()
 
-    d1["Filtered_Signal"] = np.where(
-        raw_long_1h & (d1["Trend_4H"] == "BULLISH"), "شراء (Long)",
-        np.where(raw_short_1h & (d1["Trend_4H"] == "BEARISH"), "بيع (Short)", "تجاهل")
+    d["VOL_RATIO"] = (
+        d.Volume / d.VOL_MA.replace(0, np.nan)
     )
 
-    risk_dist = d1["ATR_1H"] * sl_atr_mult
-    d1["Entry"] = np.where(d1["Filtered_Signal"] != "تجاهل", d1["Close"], np.nan)
+    return d.dropna()
 
-    d1["Stop_Loss"] = np.where(
-        d1["Filtered_Signal"] == "شراء (Long)", d1["Entry"] - risk_dist,
-        np.where(d1["Filtered_Signal"] == "بيع (Short)", d1["Entry"] + risk_dist, np.nan)
+
+# =====================================
+# TREND ANALYSIS
+# =====================================
+
+def get_trend(df):
+
+    x = df.iloc[-1]
+
+    if (
+        x.Close > x.EMA20
+        and x.EMA20 > x.EMA50
+        and x.EMA50 > x.EMA200
+    ):
+        return "BULLISH"
+
+    if (
+        x.Close < x.EMA20
+        and x.EMA20 < x.EMA50
+        and x.EMA50 < x.EMA200
+    ):
+        return "BEARISH"
+
+    return "NEUTRAL"
+
+
+# =====================================
+# SIGNAL ENGINE
+# =====================================
+
+def analyze(symbol):
+
+    d15 = indicators(
+        get_klines(symbol, "15m")
     )
 
-    d1["TP1"] = np.where(
-        d1["Filtered_Signal"] == "شراء (Long)", d1["Entry"] + (risk_dist * tp1_rr),
-        np.where(d1["Filtered_Signal"] == "بيع (Short)", d1["Entry"] - (risk_dist * tp1_rr), np.nan)
+    d1 = indicators(
+        get_klines(symbol, "1h")
     )
 
-    d1["TP2"] = np.where(
-        d1["Filtered_Signal"] == "شراء (Long)", d1["Entry"] + (risk_dist * tp2_rr),
-        np.where(d1["Filtered_Signal"] == "بيع (Short)", d1["Entry"] - (risk_dist * tp2_rr), np.nan)
+    d4 = indicators(
+        get_klines(symbol, "4h")
     )
 
-    d1["Risk_Per_Unit"] = (d1["Entry"] - d1["Stop_Loss"]).abs()
-    max_loss_dollars = account_size * (risk_pct / 100.0)
-    d1["Suggested_Units"] = np.where(
-        d1["Risk_Per_Unit"] > 0,
-        max_loss_dollars / d1["Risk_Per_Unit"],
-        0.0
-    )
+    if min(len(d15), len(d1), len(d4)) < 30:
+        return None
 
-    return d1.dropna(subset=["ATR_1H", "EMA_4H"])
+    a = d15.iloc[-1]
+    h1 = d1.iloc[-1]
+    h4 = d4.iloc[-1]
 
+    trend15 = get_trend(d15)
+    trend1 = get_trend(d1)
+    trend4 = get_trend(d4)
 
-raw_1h = load_1h_data(symbol, period)
-source_label = "بيانات السوق (Yahoo Finance)"
+    score_long = 0
+    score_short = 0
 
-if raw_1h.empty:
-    if use_demo:
-        raw_1h = generate_demo_1h()
-        source_label = "بيانات تجريبية (Demo)"
+    # الاتجاه 4H
+    if trend4 == "BULLISH":
+        score_long += 25
+
+    if trend4 == "BEARISH":
+        score_short += 25
+
+    # الاتجاه 1H
+    if trend1 == "BULLISH":
+        score_long += 25
+
+    if trend1 == "BEARISH":
+        score_short += 25
+
+    # EMA 15M
+    if a.Close > a.EMA20:
+        score_long += 10
+
+    if a.Close < a.EMA20:
+        score_short += 10
+
+    # RSI
+    if 50 < a.RSI < 70:
+        score_long += 10
+
+    if 30 < a.RSI < 50:
+        score_short += 10
+
+    # MACD
+    if a.MACD > a.MACD_SIGNAL:
+        score_long += 10
+
+    if a.MACD < a.MACD_SIGNAL:
+        score_short += 10
+
+    # Volume
+    if a.VOL_RATIO >= 1.5:
+        if a.Close > a.Open:
+            score_long += 10
+
+        elif a.Close < a.Open:
+            score_short += 10
+
+    # اختراق القمة أو القاع السابق
+    previous_high = d15.High.iloc[-21:-1].max()
+    previous_low = d15.Low.iloc[-21:-1].min()
+
+    if a.Close > previous_high:
+        score_long += 10
+
+    if a.Close < previous_low:
+        score_short += 10
+
+    # اختيار الإشارة
+    if score_long >= 70 and score_long > score_short:
+
+        signal = "LONG"
+        score = score_long
+
+    elif score_short >= 70 and score_short > score_long:
+
+        signal = "SHORT"
+        score = score_short
+
     else:
-        st.error(f"تعذر جلب بيانات `1h` للرمز `{symbol}`.")
-        st.stop()
 
-df_4h = build_4h_from_1h(raw_1h)
-df_filtered = filter_1h_with_4h(raw_1h, df_4h)
-active_signals = df_filtered[df_filtered["Filtered_Signal"] != "تجاهل"].copy()
+        signal = "WAIT"
+        score = max(score_long, score_short)
 
-latest_trend_4h = df_filtered["Trend_4H"].iloc[-1] if not df_filtered.empty else "غير محدد"
-trend_ar = "صاعد (BULLISH)" if latest_trend_4h == "BULLISH" else ("هابط (BEARISH)" if latest_trend_4h == "BEARISH" else "محايد")
+    entry = float(a.Close)
+    atr = float(a.ATR)
 
-st.info(
-    f"الرمز: **`{symbol}`** | المصدر: **{source_label}** | "
-    f"اتجاه 4h الحالي: **{trend_ar}** | الإشارات المفلترة على 1h: **{len(active_signals)}**"
+    if not np.isfinite(atr) or atr <= 0:
+        return None
+
+    sl_distance = atr * 1.5
+
+    if signal == "LONG":
+
+        sl = entry - sl_distance
+
+        tp1 = entry + sl_distance
+        tp2 = entry + sl_distance * 2
+        tp3 = entry + sl_distance * 3
+
+    elif signal == "SHORT":
+
+        sl = entry + sl_distance
+
+        tp1 = entry - sl_distance
+        tp2 = entry - sl_distance * 2
+        tp3 = entry - sl_distance * 3
+
+    else:
+
+        sl = np.nan
+        tp1 = np.nan
+        tp2 = np.nan
+        tp3 = np.nan
+
+    return {
+        "symbol": symbol,
+        "signal": signal,
+        "score": score,
+        "entry": entry,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
+        "rsi": float(a.RSI),
+        "volume": float(a.VOL_RATIO),
+        "atr": atr,
+        "trend4": trend4,
+        "trend1": trend1,
+        "trend15": trend15,
+        "chart": d15
+    }
+
+
+# =====================================
+# SIDEBAR
+# =====================================
+
+st.sidebar.title("⚙️ إعدادات النظام")
+
+mode = st.sidebar.radio(
+    "نوع التحليل",
+    ["تحليل عملة واحدة", "ماسح العملات"]
 )
 
-# --- عرض أحدث إشارة مفلترة ---
-if not active_signals.empty:
-    last_sig = active_signals.iloc[-1]
-    st.subheader("📌 أحدث إشارة 1h متوافقة مع اتجاه 4h")
+min_score = st.sidebar.slider(
+    "أقل قوة للإشارة",
+    60, 100, 70
+)
 
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("الإشارة", str(last_sig["Filtered_Signal"]))
-    c2.metric("الدخول", f"{last_sig['Entry']:.2f}")
-    c3.metric("وقف الخسارة (SL)", f"{last_sig['Stop_Loss']:.2f}")
-    c4.metric(f"الهدف 1 ({tp1_rr}R)", f"{last_sig['TP1']:.2f}")
-    c5.metric(f"الهدف 2 ({tp2_rr}R)", f"{last_sig['TP2']:.2f}")
+risk_percent = st.sidebar.slider(
+    "نسبة المخاطرة %",
+    0.25, 5.0, 1.0
+)
 
-    max_loss = account_size * (risk_pct / 100.0)
-    st.markdown(
-        f"- **مسافة الوقف:** `{last_sig['Risk_Per_Unit']:.2f}` | "
-        f"**الحد الأقصى للمخاطرة:** `${max_loss:,.2f}` | "
-        f"**الحجم التقديري:** `{last_sig['Suggested_Units']:.4f}`"
-    )
+capital = st.sidebar.number_input(
+    "رأس المال بالدولار",
+    min_value=10.0,
+    value=1000.0
+)
+
+leverage = st.sidebar.slider(
+    "الرافعة المالية",
+    1, 50, 5
+)
+
+
+# =====================================
+# SINGLE COIN
+# =====================================
+
+if mode == "تحليل عملة واحدة":
+
+    symbol = st.sidebar.text_input(
+        "رمز العملة",
+        "BTCUSDT"
+    ).strip().upper()
+
+    if st.button("🔍 ابدأ التحليل", use_container_width=True):
+
+        try:
+
+            with st.spinner("جاري تحليل السوق..."):
+
+                result = analyze(symbol)
+
+            if result is None:
+                st.warning("لا توجد بيانات كافية.")
+                st.stop()
+
+            st.subheader(f"📊 تحليل {symbol}")
+
+            color = (
+                "🟢" if result["signal"] == "LONG"
+                else "🔴" if result["signal"] == "SHORT"
+                else "🟡"
+            )
+
+            c1, c2, c3 = st.columns(3)
+
+            c1.metric(
+                "الإشارة",
+                color + " " + result["signal"]
+            )
+
+            c2.metric(
+                "قوة الإشارة",
+                f'{result["score"]}/100'
+            )
+
+            c3.metric(
+                "RSI",
+                f'{result["rsi"]:.2f}'
+            )
+
+            if result["signal"] != "WAIT":
+
+                st.success("تم اكتشاف فرصة تداول محتملة")
+
+                c1, c2, c3 = st.columns(3)
+
+                c1.metric("Entry", f'{result["entry"]:.6g}')
+                c2.metric("Stop Loss", f'{result["sl"]:.6g}')
+                c3.metric("ATR", f'{result["atr"]:.6g}')
+
+                c1, c2, c3 = st.columns(3)
+
+                c1.metric("TP1", f'{result["tp1"]:.6g}')
+                c2.metric("TP2", f'{result["tp2"]:.6g}')
+                c3.metric("TP3", f'{result["tp3"]:.6g}')
+
+                risk_money = capital * risk_percent / 100
+
+                qty = risk_money / abs(
+                    result["entry"] - result["sl"]
+                )
+
+                notional = qty * result["entry"]
+
+                st.info(
+                    f"""
+                    مبلغ المخاطرة: ${risk_money:.2f}
+
+                    كمية العملة التقديرية: {qty:.6g}
+
+                    القيمة الاسمية للصفقة: ${notional:.2f}
+
+                    الهامش التقريبي عند رافعة {leverage}x:
+                    ${notional / leverage:.2f}
+                    """
+                )
+
+            else:
+
+                st.warning("لا توجد إشارة دخول مكتملة حالياً.")
+
+            # CHART
+
+            d = result["chart"].tail(120)
+
+            fig = go.Figure()
+
+            fig.add_trace(go.Candlestick(
+                x=d.index,
+                open=d.Open,
+                high=d.High,
+                low=d.Low,
+                close=d.Close,
+                name="15M"
+            ))
+
+            for col in ["EMA20", "EMA50", "EMA200"]:
+
+                fig.add_trace(go.Scatter(
+                    x=d.index,
+                    y=d[col],
+                    name=col,
+                    mode="lines"
+                ))
+
+            if result["signal"] != "WAIT":
+
+                for price, name in [
+                    (result["sl"], "SL"),
+                    (result["tp1"], "TP1"),
+                    (result["tp2"], "TP2"),
+                    (result["tp3"], "TP3")
+                ]:
+
+                    fig.add_hline(
+                        y=price,
+                        annotation_text=name,
+                        line_dash="dash"
+                    )
+
+            fig.update_layout(
+                template="plotly_dark",
+                height=600,
+                xaxis_rangeslider_visible=False
+            )
+
+            st.plotly_chart(
+                fig,
+                use_container_width=True
+            )
+
+        except Exception as e:
+
+            st.error(f"خطأ أثناء التحليل: {e}")
+
+
+# =====================================
+# MARKET SCANNER
+# =====================================
+
 else:
-    st.warning("لا توجد إشارات متوافقة بين 4h و1h بالإعدادات الحالية؛ جرّب تعديل نافذة الكسر أو فترة EMA.")
 
-# --- الرسم البياني لفريم 1h مع EMA فريم 4h ---
-st.subheader("📈 شارت 1 ساعة مع خط اتجاه 4 ساعات (EMA)")
+    st.subheader("🔎 ماسح فرص العقود الآجلة")
 
-fig = go.Figure()
-fig.add_trace(go.Candlestick(
-    x=df_filtered.index,
-    open=df_filtered["Open"],
-    high=df_filtered["High"],
-    low=df_filtered["Low"],
-    close=df_filtered["Close"],
-    name="شموع 1h"
-))
+    scan_count = st.sidebar.slider(
+        "عدد العملات للفحص",
+        5, 50, 20
+    )
 
-fig.add_trace(go.Scatter(
-    x=df_filtered.index,
-    y=df_filtered["EMA_4H"],
-    mode="lines",
-    line=dict(color="orange", width=2),
-    name=f"EMA {ema_4h_period} (فريم 4h)"
-))
+    if st.button("🚀 ابدأ فحص السوق"):
 
-if not active_signals.empty:
-    longs = active_signals[active_signals["Filtered_Signal"] == "شراء (Long)"]
-    shorts = active_signals[active_signals["Filtered_Signal"] == "بيع (Short)"]
+        try:
 
-    fig.add_trace(go.Scatter(
-        x=longs.index,
-        y=longs["Low"] * 0.998,
-        mode="markers",
-        marker=dict(symbol="triangle-up", size=12, color="lime"),
-        name="شراء مفلتر"
-    ))
+            with st.spinner("جاري فحص العملات..."):
 
-    fig.add_trace(go.Scatter(
-        x=shorts.index,
-        y=shorts["High"] * 1.002,
-        mode="markers",
-        marker=dict(symbol="triangle-down", size=12, color="red"),
-        name="بيع مفلتر"
-    ))
+                symbols = get_symbols()
 
-    last_row = active_signals.iloc[-1]
-    fig.add_hline(y=last_row["Stop_Loss"], line_dash="dash", line_color="red", annotation_text="SL")
-    fig.add_hline(y=last_row["TP1"], line_dash="dot", line_color="green", annotation_text="TP1")
-    fig.add_hline(y=last_row["TP2"], line_dash="dot", line_color="cyan", annotation_text="TP2")
+                tickers = get_tickers()
 
-fig.update_layout(height=520, xaxis_rangeslider_visible=False, template="plotly_dark")
-st.plotly_chart(fig, use_container_width=True)
+                tickers = tickers[
+                    tickers.symbol.isin(symbols)
+                ].copy()
 
-# --- جدول الإشارات المفلترة ---
-if not active_signals.empty:
-    st.subheader("📋 سجل الإشارات المفلترة")
-    out_df = pd.DataFrame({
-        "الوقت": active_signals.index.strftime("%Y-%m-%d %H:%M"),
-        "اتجاه 4h": active_signals["Trend_4H"].values,
-        "إشارة 1h": active_signals["Filtered_Signal"].values,
-        "الدخول": active_signals["Entry"].round(2).values,
-        "وقف الخسارة": active_signals["Stop_Loss"].round(2).values,
-        "الهدف 1": active_signals["TP1"].round(2).values,
-        "الهدف 2": active_signals["TP2"].round(2).values,
-        "حجم مقترح": active_signals["Suggested_Units"].round(4).values,
-    })
-    st.dataframe(out_df.iloc[::-1], use_container_width=True, hide_index=True)
+                tickers["quoteVolume"] = pd.to_numeric(
+                    tickers["quoteVolume"]
+                )
+
+                top = tickers.sort_values(
+                    "quoteVolume",
+                    ascending=False
+                ).head(scan_count)
+
+                results = []
+
+                progress = st.progress(0)
+
+                for i, symbol in enumerate(top.symbol):
+
+                    try:
+
+                        result = analyze(symbol)
+
+                        if result:
+
+                            if (
+                                result["signal"] != "WAIT"
+                                and result["score"] >= min_score
+                            ):
+
+                                results.append(result)
+
+                    except Exception:
+                        pass
+
+                    progress.progress(
+                        (i + 1) / len(top)
+                    )
+
+                progress.empty()
+
+            if results:
+
+                table = pd.DataFrame([
+                    {
+                        "العملة": x["symbol"],
+                        "الإشارة": x["signal"],
+                        "القوة": x["score"],
+                        "السعر": x["entry"],
+                        "RSI": round(x["rsi"], 2),
+                        "Volume": round(x["volume"], 2),
+                        "الاتجاه 4H": x["trend4"],
+                        "الاتجاه 1H": x["trend1"]
+                    }
+                    for x in results
+                ])
+
+                table = table.sort_values(
+                    "القوة",
+                    ascending=False
+                )
+
+                st.success(
+                    f"تم العثور على {len(results)} فرصة محتملة"
+                )
+
+                st.dataframe(
+                    table,
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+                selected = st.selectbox(
+                    "اختر عملة لعرض تفاصيلها",
+                    table["العملة"].tolist()
+                )
+
+                chosen = next(
+                    x for x in results
+                    if x["symbol"] == selected
+                )
+
+                st.json({
+                    "Signal": chosen["signal"],
+                    "Score": chosen["score"],
+                    "Entry": chosen["entry"],
+                    "Stop Loss": chosen["sl"],
+                    "TP1": chosen["tp1"],
+                    "TP2": chosen["tp2"],
+                    "TP3": chosen["tp3"]
+                })
+
+            else:
+
+                st.warning(
+                    "لم يتم العثور على إشارات قوية حالياً."
+                )
+
+        except Exception as e:
+
+            st.error(f"فشل فحص السوق: {e}")
+
+
+st.divider()
+
+st.caption(
+    "GALEIC FUTURES PRO | Market Analysis System | "
+    "التحليل لا يضمن الربح ولا ينفذ الصفقات تلقائياً."
+    )
