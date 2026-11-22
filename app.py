@@ -15,6 +15,18 @@ EXCHANGES = {
     'okx':     ccxt.okx({'options': {'defaultType': 'swap'}, 'enableRateLimit': True}),
 }
 
+# تحويل أسماء الرموز حسب كل منصة
+def normalize_symbol(symbol, exchange_name):
+    """يحوّل BTC/USDT إلى الصيغة الصحيحة لكل منصة"""
+    base, quote = symbol.split('/')
+    if exchange_name == 'binance':
+        return f"{base}/{quote}"
+    elif exchange_name == 'bybit':
+        return f"{base}/{quote}:{quote}"
+    elif exchange_name == 'okx':
+        return f"{base}-{quote}-SWAP"
+    return symbol
+
 def get_symbol_candidates(symbol):
     """يرجع الصيغ الممكنة للرمز حسب المنصة"""
     base, quote = symbol.replace('-', '/').replace('SWAP', '').split('/')
@@ -171,6 +183,7 @@ def signal_engine(df):
     reward = abs(tp2 - price)
     rr     = reward / risk if risk > 0 else 0
 
+    # ليفرج مقترح حسب الفريم (سيُحدَّث في الكود الخارجي)
     return {
         "signal": direction,
         "entry": price,
@@ -185,10 +198,10 @@ def signal_engine(df):
     }
 
 # ============================================================
-#               التحليل عبر أكثر من منصة (تجميعي ومرن)
+#               التحليل عبر أكثر من منصة (تجميعي)
 # ============================================================
 def analyze_multi(symbol, timeframe, leverage_suggestion=None):
-    """يحلل العملة على المنصات المتاحة ويقبل الإشارة حتى لو توقفت بعض المنصات"""
+    """يحلل نفس العملة على المنصات الثلاث ويجمع النتائج"""
     results = {}
     for name in EXCHANGES:
         try:
@@ -198,57 +211,33 @@ def analyze_multi(symbol, timeframe, leverage_suggestion=None):
             res['price'] = df['close'].iloc[-1]
             results[name] = res
         except Exception as e:
-            # حفظ نص الخطأ بوضوح مع نوعه
-            results[name] = {
-                "error": f"[{type(e).__name__}] {str(e)}"
-            }
+            results[name] = {"error": str(e)}
 
-    # التصويت وحساب عدد المنصات النشطة
+    # التصويت: كم منصة تقول LONG / SHORT
     votes = {"LONG": 0, "SHORT": 0, "WAIT": 0}
-    active_exchanges = 0
     for name, r in results.items():
         if 'error' in r:
             continue
-        active_exchanges += 1
         votes[r.get('signal', 'WAIT')] += 1
 
-    # القرار النهائي المرن: يعتمد الأغلبية المتاحة (حتى لو عملت منصة واحدة فقط)
-    if active_exchanges == 0:
-        final = "WAIT"
-        status_note = "⚠️ تعطل الاتصال بجميع المنصات"
-    elif active_exchanges == 1:
-        if votes["LONG"] == 1:
-            final = "LONG"
-            status_note = "⚠️ تنبيه: إشارة معتمدة على منصة واحدة فقط متاحة"
-        elif votes["SHORT"] == 1:
-            final = "SHORT"
-            status_note = "⚠️ تنبيه: إشارة معتمدة على منصة واحدة فقط متاحة"
-        else:
-            final = "WAIT"
-            status_note = "ℹ️ منصة واحدة متاحة وحالتها انتظار"
+    # القرار النهائي
+    if votes["LONG"] >= 2 and votes["LONG"] > votes["SHORT"]:
+        final = "LONG"
+    elif votes["SHORT"] >= 2 and votes["SHORT"] > votes["LONG"]:
+        final = "SHORT"
     else:
-        # في حال توفر منصتين أو ثلاث، نطلب أغلبية واضحة (أو صوتين على الأقل)
-        min_votes = 2 if active_exchanges >= 2 else 1
-        if votes["LONG"] >= min_votes and votes["LONG"] > votes["SHORT"]:
-            final = "LONG"
-            status_note = f"✅ توافق {votes['LONG']} من {active_exchanges} منصات"
-        elif votes["SHORT"] >= min_votes and votes["SHORT"] > votes["LONG"]:
-            final = "SHORT"
-            status_note = f"✅ توافق {votes['SHORT']} من {active_exchanges} منصات"
-        else:
-            final = "WAIT"
-            status_note = "ℹ️ لا يوجد إجماع كافٍ بين المنصات المتاحة"
+        final = "WAIT"
 
-    # متوسط السعر والمستويات من المنصات المتفقة
+    # متوسط السعر والمستويات (من المنصات التي أعطت نفس الإشارة)
     same = [r for r in results.values() if r.get('signal') == final and 'error' not in r]
     if same and final != "WAIT":
         avg = {
-            "entry":     np.mean([r['price']      for r in same]),
-            "stop_loss": np.mean([r['stop_loss']  for r in same]),
-            "tp1":       np.mean([r['tp1']        for r in same]),
-            "tp2":       np.mean([r['tp2']        for r in same]),
-            "tp3":       np.mean([r['tp3']        for r in same]),
-            "rr":        np.mean([r['rr']         for r in same]),
+            "entry":    np.mean([r['price']      for r in same]),
+            "stop_loss":np.mean([r['stop_loss']  for r in same]),
+            "tp1":      np.mean([r['tp1']        for r in same]),
+            "tp2":      np.mean([r['tp2']        for r in same]),
+            "tp3":      np.mean([r['tp3']        for r in same]),
+            "rr":       np.mean([r['rr']         for r in same]),
         }
     else:
         avg = None
@@ -257,8 +246,6 @@ def analyze_multi(symbol, timeframe, leverage_suggestion=None):
         "symbol": symbol,
         "timeframe": timeframe,
         "votes": votes,
-        "active_exchanges": active_exchanges,
-        "status_note": status_note,
         "final": final,
         "levels": avg,
         "details": results
@@ -279,12 +266,13 @@ def print_result(r, leverage=10):
 
     votes = r['votes']
     color = Fore.GREEN if r['final'] == "LONG" else (Fore.RED if r['final'] == "SHORT" else Fore.YELLOW)
-    print(f"  🗳️  تصويت المنصات ({r.get('active_exchanges', 0)}/3 نشطة): LONG={votes['LONG']} | SHORT={votes['SHORT']} | WAIT={votes['WAIT']}")
-    print(f"  🎯 القرار النهائي: {color}{r['final']}{Style.RESET_ALL}  ({r.get('status_note', '')})")
+    print(f"  🗳️  تصويت المنصات: LONG={votes['LONG']} | SHORT={votes['SHORT']} | WAIT={votes['WAIT']}")
+    print(f"  🎯 القرار النهائي: {color}{r['final']}{Style.RESET_ALL}")
 
+    # تفاصيل كل منصة
     for name, d in r['details'].items():
         if 'error' in d:
-            print(f"\n  ❌ {name.upper()} فشل الاتصال:\n     السبب: {d['error']}")
+            print(f"\n  ❌ {name}: {d['error']}")
             continue
         c = Fore.GREEN if d.get('signal')=="LONG" else (Fore.RED if d.get('signal')=="SHORT" else Fore.YELLOW)
         print(f"\n  ── {name.upper()} ──  {c}{d.get('signal','WAIT')}{Style.RESET_ALL}  "
@@ -296,10 +284,11 @@ def print_result(r, leverage=10):
                   f"TP2: {fmt_price(d['tp2'])}  |  TP3: {fmt_price(d['tp3'])}")
             print(f"     ⚖️  R:R = 1:{d['rr']:.2f}")
 
+    # المستويات الموصى بها
     if r['levels']:
         L = r['levels']
         print("\n" + "-"*65)
-        print(f"  ✅ المستويات الموصى بها:")
+        print(f"  ✅ المستويات الموصى بها (متوسط المنصات المتفقة):")
         print(f"     💰 الدخول:        {fmt_price(L['entry'])}")
         print(f"     🛑 وقف الخسارة:  {fmt_price(L['stop_loss'])}")
         print(f"     🎯 الهدف 1:      {fmt_price(L['tp1'])}")
@@ -308,6 +297,7 @@ def print_result(r, leverage=10):
         print(f"     ⚖️  R:R = 1:{L['rr']:.2f}")
         print(f"     🔥 ليفرج مقترح: {leverage}x")
 
+        # حساب الربح/الخسارة تقديري
         entry = L['entry']
         if r['final'] == "LONG":
             pnl_sl = (L['stop_loss'] - entry) / entry * 100 * leverage
@@ -318,7 +308,8 @@ def print_result(r, leverage=10):
         print(f"     📉 خسارة متوقعة على SL  : {pnl_sl:+.2f}% (برافعة)")
         print(f"     📈 ربح متوقع على TP2    : {pnl_tp2:+.2f}% (برافعة)")
 
-    print("\n  📝 أسباب الإشارة:")
+    # أسباب
+    print("\n  📝 أسباب الإشارة (من أول منصة حدثت):")
     for name, d in r['details'].items():
         if 'error' not in d and d.get('signal') == r['final'] and d.get('reasons'):
             for reason in d['reasons'][:5]:
@@ -326,29 +317,17 @@ def print_result(r, leverage=10):
             break
 
 # ============================================================
-#               البحث عن أفضل الفرص في السوق (مع بديل تلقائي)
+#               البحث عن أفضل الفرص في السوق
 # ============================================================
 def scan_top_symbols(top_n=30, timeframe='1h', min_score=5):
-    """يمسح أفضل العملات من Binance أو OKX كبديل تلقائي ثم يحللها"""
-    source_ex = None
-    markets = {}
-    tickers = {}
-
-    # محاولة الجلب من Binance أولاً ثم OKX كبديل في حال الحظر السحابي
-    for candidate in ['binance', 'okx']:
-        try:
-            ex = EXCHANGES[candidate]
-            markets = ex.load_markets()
-            tickers = ex.fetch_tickers()
-            source_ex = candidate
-            break
-        except Exception as e:
-            print(f"⚠️ تعذر جلب قائمة العملات من {candidate}: [{type(e).__name__}] {e}")
-
-    if not source_ex:
-        return []
-
-    usdt = [s for s in markets if markets[s].get('swap') and s.endswith('/USDT:USDT')]
+    """يمسح أفضل العملات من Binance ثم يحللها على المنصات الثلاث"""
+    print(f"\n🔍 جاري مسح أفضل {top_n} عملة على فريم {timeframe}...")
+    ex = EXCHANGES['binance']
+    tickers = ex.fetch_tickers()
+    usdt = [s for s in tickers if s.endswith('/USDT') and ':USDT' in ex.markets.get(s, {}).get('symbol','')]
+    # فلترة الأزواج المستقبلية
+    usdt = [s for s in ex.markets if ex.markets[s].get('swap') and s.endswith('/USDT:USDT')]
+    # ترتيب حسب حجم التداول
     usdt_sorted = sorted(
         usdt,
         key=lambda s: tickers.get(s, {}).get('quoteVolume', 0) or 0,
@@ -364,7 +343,39 @@ def scan_top_symbols(top_n=30, timeframe='1h', min_score=5):
                 opportunities.append(r)
         except Exception:
             continue
-        time.sleep(0.2)
+        time.sleep(0.2)  # تجنب حدود الـ API
 
+    # رتب حسب القوة
     opportunities.sort(key=lambda x: x['votes'][x['final']], reverse=True)
     return opportunities
+
+# ============================================================
+#                   التشغيل
+# ============================================================
+if __name__ == "__main__":
+
+    print(Fore.CYAN + "="*65)
+    print(Fore.CYAN + "   🚀 أداة تحليل فيوتشر متعددة المنصات")
+    print(Fore.CYAN + "   Binance + Bybit + OKX")
+    print(Fore.CYAN + "="*65)
+
+    # ----- 1) تحليل عملة معينة على الفريمات -----
+    symbol = "BTC/USDT"     # غيّرها لأي عملة
+    for tf in ['15m', '1h', '4h']:
+        try:
+            result = analyze_multi(symbol, tf)
+            leverage = {'15m': 20, '1h': 10, '4h': 5}.get(tf, 10)
+            print_result(result, leverage=leverage)
+        except Exception as e:
+            print(f"\n❌ خطأ في {symbol} - {tf}: {e}")
+
+    # ----- 2) البحث عن أفضل الفرص في السوق -----
+    print("\n\n" + Fore.CYAN + "🔎 البحث عن أفضل الفرص الآن..." + Style.RESET_ALL)
+    opps = scan_top_symbols(top_n=20, timeframe='1h')
+    print(f"\n🏆 أفضل {min(10, len(opps))} فرصة تم العثور عليها:")
+    for i, o in enumerate(opps[:10], 1):
+        L = o['levels']
+        color = Fore.GREEN if o['final']=="LONG" else Fore.RED
+        print(f"  {i}. {o['symbol']:15} {color}{o['final']:5}{Style.RESET_ALL} "
+              f"| دخول: {fmt_price(L['entry'])} | R:R=1:{L['rr']:.2f} "
+              f"| ثقة: {o['votes'][o['final']]}/3")
