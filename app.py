@@ -4,16 +4,16 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from colorama import Fore, Style, init
-
-init(autoreset=True)
 
 st.set_page_config(
-    page_title="Futures Signal Scanner Pro",
+    page_title="Futures Signal Scanner Pro v3.0",
     page_icon="📡",
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+TIMEFRAMES = ["5m", "15m", "30m", "1h", "2h", "4h", "1d"]
+
 
 # ============================================================
 #                    إعداد المنصات
@@ -21,8 +21,8 @@ st.set_page_config(
 @st.cache_resource
 def get_exchanges():
     return {
-        "binance": ccxt.binance({
-            "options": {"defaultType": "future"},
+        "okx": ccxt.okx({
+            "options": {"defaultType": "swap"},
             "enableRateLimit": True,
             "timeout": 15000,
         }),
@@ -31,8 +31,8 @@ def get_exchanges():
             "enableRateLimit": True,
             "timeout": 15000,
         }),
-        "okx": ccxt.okx({
-            "options": {"defaultType": "swap"},
+        "binance": ccxt.binance({
+            "options": {"defaultType": "future"},
             "enableRateLimit": True,
             "timeout": 15000,
         }),
@@ -42,264 +42,323 @@ def get_exchanges():
 EXCHANGES = get_exchanges()
 
 
-def get_symbol_candidates(symbol):
-    """يرجع الصيغة المناسبة للرمز حسب كل منصة"""
-    cleaned = symbol.strip().upper().replace("-", "/").replace(":USDT", "").replace("-SWAP", "")
-    if "/" not in cleaned:
-        cleaned = f"{cleaned}/USDT"
-    base, quote = cleaned.split("/")[:2]
-    return {
-        "binance": f"{base}/{quote}",
-        "bybit": f"{base}/{quote}:{quote}",
-        "okx": f"{base}-{quote}-SWAP",
-    }
+def normalize_input_symbol(raw_symbol: str) -> str:
+    s = (raw_symbol or "BTC/USDT").strip().upper()
+    s = s.replace("-SWAP", "").replace(":USDT", "").replace("-", "/")
+    if "/" not in s:
+        s = f"{s}/USDT"
+    base, quote = s.split("/")[:2]
+    base = base.strip()
+    quote = (quote or "USDT").strip()
+    return f"{base}/{quote}"
+
+
+def get_symbol_for_exchange(clean_symbol: str, exchange_name: str) -> str:
+    base, quote = clean_symbol.split("/")
+    if exchange_name == "binance":
+        return f"{base}/{quote}"
+    if exchange_name == "bybit":
+        return f"{base}/{quote}:{quote}"
+    if exchange_name == "okx":
+        return f"{base}-{quote}-SWAP"
+    return clean_symbol
 
 
 # ============================================================
-#                   جلب البيانات وحساب المؤشرات
+#                   جلب البيانات والمؤشرات
 # ============================================================
-def fetch_data(exchange_name, symbol, timeframe, limit=500):
+def fetch_ohlcv_df(exchange_name: str, clean_symbol: str, timeframe: str, limit: int = 400) -> pd.DataFrame:
     ex = EXCHANGES[exchange_name]
-    sym = get_symbol_candidates(symbol)[exchange_name]
+    sym = get_symbol_for_exchange(clean_symbol, exchange_name)
     ohlcv = ex.fetch_ohlcv(sym, timeframe, limit=limit)
-    if not ohlcv or len(ohlcv) < 200:
-        raise ValueError(f"بيانات غير كافية من {exchange_name} لـ {symbol}")
+    if not ohlcv or len(ohlcv) < 210:
+        raise ValueError(f"بيانات غير كافية ({len(ohlcv) if ohlcv else 0} شمعة) من {exchange_name} لـ {sym}")
     df = pd.DataFrame(ohlcv, columns=["time", "open", "high", "low", "close", "volume"])
     df["timestamp"] = pd.to_datetime(df["time"], unit="ms")
     return df
 
 
-def calculate_indicators(df):
-    df = df.copy()
-    df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
-    df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
-    df["ema200"] = df["close"].ewm(span=200, adjust=False).mean()
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    d = df.copy()
+    close = d["close"].astype(float)
+    high = d["high"].astype(float)
+    low = d["low"].astype(float)
+    vol = d["volume"].astype(float)
 
-    delta = df["close"].diff()
-    gain = delta.where(delta > 0, 0).rolling(14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-    rs = gain / loss.replace(0, np.nan)
-    df["rsi"] = 100 - (100 / (1 + rs))
+    d["ema20"] = close.ewm(span=20, adjust=False).mean()
+    d["ema50"] = close.ewm(span=50, adjust=False).mean()
+    d["ema200"] = close.ewm(span=200, adjust=False).mean()
 
-    exp1 = df["close"].ewm(span=12, adjust=False).mean()
-    exp2 = df["close"].ewm(span=26, adjust=False).mean()
-    df["macd"] = exp1 - exp2
-    df["signal"] = df["macd"].ewm(span=9, adjust=False).mean()
+    delta = close.diff()
+    gain = delta.where(delta > 0, 0.0).rolling(14).mean()
+    loss = (-delta.where(delta < 0, 0.0)).rolling(14).mean()
+    rs = gain / loss.replace(0.0, np.nan)
+    d["rsi"] = 100.0 - (100.0 / (1.0 + rs))
 
-    prev_close = df["close"].shift()
-    df["tr"] = np.maximum(
-        df["high"] - df["low"],
-        np.maximum((df["high"] - prev_close).abs(), (df["low"] - prev_close).abs()),
-    )
-    df["atr"] = df["tr"].rolling(14).mean()
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    d["macd"] = ema12 - ema26
+    d["macd_signal"] = d["macd"].ewm(span=9, adjust=False).mean()
+    d["macd_hist"] = d["macd"] - d["macd_signal"]
 
-    df["bb_mid"] = df["close"].rolling(20).mean()
-    df["bb_std"] = df["close"].rolling(20).std()
-    df["bb_up"] = df["bb_mid"] + 2 * df["bb_std"]
-    df["bb_dn"] = df["bb_mid"] - 2 * df["bb_std"]
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [
+            high - low,
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    d["atr"] = tr.rolling(14).mean()
 
-    df["vol_ma"] = df["volume"].rolling(20).mean()
+    d["bb_mid"] = close.rolling(20).mean()
+    d["bb_std"] = close.rolling(20).std()
+    d["bb_up"] = d["bb_mid"] + 2.0 * d["bb_std"]
+    d["bb_dn"] = d["bb_mid"] - 2.0 * d["bb_std"]
 
-    rsi_min = df["rsi"].rolling(14).min()
-    rsi_max = df["rsi"].rolling(14).max()
-    df["stoch_rsi"] = (df["rsi"] - rsi_min) / (rsi_max - rsi_min).replace(0, np.nan)
+    d["vol_ma"] = vol.rolling(20).mean()
 
-    return df
+    rsi_min = d["rsi"].rolling(14).min()
+    rsi_max = d["rsi"].rolling(14).max()
+    d["stoch_rsi"] = (d["rsi"] - rsi_min) / (rsi_max - rsi_min).replace(0.0, np.nan)
+
+    return d
 
 
 # ============================================================
-#                   محرك الإشارات
+#                   محرك الإشارات والأهداف
 # ============================================================
-def signal_engine(df):
+def evaluate_signal(df: pd.DataFrame, min_score: int = 6) -> dict:
     last = df.iloc[-1]
     prev = df.iloc[-2]
+
     long_score = 0
     short_score = 0
-    reasons = []
+    long_reasons = []
+    short_reasons = []
 
-    if last["close"] > last["ema200"]:
-        long_score += 2
-        reasons.append("فوق EMA200 (اتجاه صاعد)")
-    else:
-        short_score += 2
-        reasons.append("تحت EMA200 (اتجاه هابط)")
+    price = float(last["close"])
+    atr = float(last["atr"]) if pd.notna(last["atr"]) and last["atr"] > 0 else price * 0.012
 
-    if last["ema20"] > last["ema50"]:
-        long_score += 1
-        reasons.append("EMA20 أعلى من EMA50")
-    else:
-        short_score += 1
-        reasons.append("EMA20 أدنى من EMA50")
-
-    if pd.notna(last["rsi"]):
-        if last["rsi"] < 35:
+    # 1. الاتجاه العام طويل المدى (EMA 200)
+    if pd.notna(last["ema200"]):
+        if price > last["ema200"]:
             long_score += 2
-            reasons.append(f"RSI={last['rsi']:.1f} (تشبع بيعي)")
-        elif last["rsi"] > 65:
+            long_reasons.append("السعر أعلى من EMA 200 (اتجاه عام صاعد)")
+        else:
             short_score += 2
-            reasons.append(f"RSI={last['rsi']:.1f} (تشبع شرائي)")
+            short_reasons.append("السعر أدنى من EMA 200 (اتجاه عام هابط)")
 
-    if last["macd"] > last["signal"] and prev["macd"] <= prev["signal"]:
-        long_score += 2
-        reasons.append("تقاطع MACD صاعد")
-    elif last["macd"] < last["signal"] and prev["macd"] >= prev["signal"]:
-        short_score += 2
-        reasons.append("تقاطع MACD هابط")
+    # 2. اصطفاف المتوسطات المتوسطة (EMA 20 / EMA 50)
+    if pd.notna(last["ema20"]) and pd.notna(last["ema50"]):
+        if last["ema20"] > last["ema50"] and price > last["ema20"]:
+            long_score += 2
+            long_reasons.append("توافق EMA 20 فوق EMA 50 مع زخم سعري إيجابي")
+        elif last["ema20"] < last["ema50"] and price < last["ema20"]:
+            short_score += 2
+            short_reasons.append("توافق EMA 20 تحت EMA 50 مع زخم سعري سلبي")
 
-    if pd.notna(last["vol_ma"]) and last["vol_ma"] > 0 and last["volume"] > last["vol_ma"] * 1.2:
-        if last["close"] > prev["close"]:
+    # 3. مؤشر RSI
+    if pd.notna(last["rsi"]):
+        rsi_val = float(last["rsi"])
+        if rsi_val < 35:
+            long_score += 2
+            long_reasons.append(f"RSI عند {rsi_val:.1f} (منطقة تشبع بيعي / ارتداد محتمل)")
+        elif 45 <= rsi_val <= 65 and price > last["ema50"]:
             long_score += 1
-            reasons.append("حجم تداول مرتفع مؤكد للصعود")
+            long_reasons.append(f"RSI صحي عند {rsi_val:.1f} داعم للصعود")
+        elif rsi_val > 65:
+            short_score += 2
+            short_reasons.append(f"RSI عند {rsi_val:.1f} (منطقة تشبع شرائي / تصحيح محتمل)")
+        elif 35 <= rsi_val <= 55 and price < last["ema50"]:
+            short_score += 1
+            short_reasons.append(f"RSI داعم للهبوط عند {rsi_val:.1f}")
+
+    # 4. مؤشر MACD
+    if pd.notna(last["macd"]) and pd.notna(last["macd_signal"]) and pd.notna(prev["macd"]) and pd.notna(prev["macd_signal"]):
+        bull_cross = last["macd"] > last["macd_signal"] and prev["macd"] <= prev["macd_signal"]
+        bear_cross = last["macd"] < last["macd_signal"] and prev["macd"] >= prev["macd_signal"]
+        if bull_cross or (last["macd"] > last["macd_signal"] and last["macd_hist"] > prev["macd_hist"]):
+            long_score += 2 if bull_cross else 1
+            long_reasons.append("تقاطع/زخم MACD إيجابي")
+        elif bear_cross or (last["macd"] < last["macd_signal"] and last["macd_hist"] < prev["macd_hist"]):
+            short_score += 2 if bear_cross else 1
+            short_reasons.append("تقاطع/زخم MACD سلبي")
+
+    # 5. حجم التداول (Volume)
+    if pd.notna(last["vol_ma"]) and last["vol_ma"] > 0 and last["volume"] > last["vol_ma"] * 1.25:
+        if last["close"] >= prev["close"]:
+            long_score += 1
+            long_reasons.append("ارتفاع حجم التداول أعلى من المتوسط مع شمعة صاعدة")
         else:
             short_score += 1
-            reasons.append("حجم تداول مرتفع مؤكد للهبوط")
+            short_reasons.append("ارتفاع حجم التداول أعلى من المتوسط مع شمعة هابطة")
 
-    if last["close"] < last["bb_dn"]:
-        long_score += 1
-        reasons.append("السعر أسفل Bollinger السفلي")
-    elif last["close"] > last["bb_up"]:
-        short_score += 1
-        reasons.append("السعر أعلى Bollinger العلوي")
-
-    if pd.notna(last["stoch_rsi"]):
-        if last["stoch_rsi"] < 0.2:
+    # 6. نطاقات بولينجر (Bollinger Bands)
+    if pd.notna(last["bb_dn"]) and pd.notna(last["bb_up"]):
+        if price <= last["bb_dn"] * 1.002:
             long_score += 1
-            reasons.append("Stochastic RSI منخفض")
-        elif last["stoch_rsi"] > 0.8:
+            long_reasons.append("ملامسة/اختراق الحد السفلي لـ Bollinger")
+        elif price >= last["bb_up"] * 0.998:
             short_score += 1
-            reasons.append("Stochastic RSI مرتفع")
+            short_reasons.append("ملامسة/اختراق الحد العلوي لـ Bollinger")
 
-    if long_score >= 5 and long_score > short_score:
+    # 7. Stochastic RSI
+    if pd.notna(last["stoch_rsi"]):
+        srsi = float(last["stoch_rsi"])
+        if srsi < 0.2:
+            long_score += 1
+            long_reasons.append("Stochastic RSI في منطقة تشبع بيعي")
+        elif srsi > 0.8:
+            short_score += 1
+            short_reasons.append("Stochastic RSI في منطقة تشبع شرائي")
+
+    max_possible = 11.0
+    if long_score >= min_score and long_score > short_score:
         direction = "LONG"
-    elif short_score >= 5 and short_score > long_score:
+        score = long_score
+        reasons = long_reasons
+        sl = price - atr * 1.4
+        tp1 = price + atr * 1.8
+        tp2 = price + atr * 3.0
+        tp3 = price + atr * 4.5
+    elif short_score >= min_score and short_score > long_score:
         direction = "SHORT"
+        score = short_score
+        reasons = short_reasons
+        sl = price + atr * 1.4
+        tp1 = price - atr * 1.8
+        tp2 = price - atr * 3.0
+        tp3 = price - atr * 4.5
     else:
+        direction = "WAIT"
+        score = max(long_score, short_score)
+        reasons = long_reasons if long_score >= short_score else short_reasons
         return {
             "signal": "WAIT",
+            "price": price,
+            "score": score,
+            "confidence": round(min(95.0, (score / max_possible) * 100.0), 1),
             "long_score": long_score,
             "short_score": short_score,
-            "score": max(long_score, short_score),
             "reasons": reasons,
         }
 
-    price = float(last["close"])
-    atr = float(last["atr"]) if pd.notna(last["atr"]) and last["atr"] > 0 else price * 0.01
-
-    if direction == "LONG":
-        sl = price - atr * 1.5
-        tp1 = price + atr * 2.0
-        tp2 = price + atr * 3.5
-        tp3 = price + atr * 5.0
-    else:
-        sl = price + atr * 1.5
-        tp1 = price - atr * 2.0
-        tp2 = price - atr * 3.5
-        tp3 = price - atr * 5.0
-
     risk = abs(price - sl)
-    reward = abs(tp2 - price)
-    rr = reward / risk if risk > 0 else 0.0
+    reward_tp2 = abs(tp2 - price)
+    rr_tp2 = reward_tp2 / risk if risk > 0 else 0.0
+    confidence = round(min(98.0, max(55.0, (score / max_possible) * 100.0)), 1)
 
     return {
         "signal": direction,
+        "price": price,
         "entry": price,
         "stop_loss": sl,
         "tp1": tp1,
         "tp2": tp2,
         "tp3": tp3,
-        "rr": rr,
+        "rr": rr_tp2,
+        "score": score,
+        "confidence": confidence,
+        "long_score": long_score,
+        "short_score": short_score,
         "rsi": float(last["rsi"]) if pd.notna(last["rsi"]) else 50.0,
-        "score": max(long_score, short_score),
         "reasons": reasons,
     }
 
 
-# ============================================================
-#               التحليل متعدد المنصات بمرونة
-# ============================================================
-def analyze_multi(symbol, timeframe):
+def analyze_symbol_multi(raw_symbol: str, timeframe: str, min_score: int = 6) -> dict:
+    clean_symbol = normalize_input_symbol(raw_symbol)
     results = {}
     dfs = {}
 
     for name in EXCHANGES:
         try:
-            df = fetch_data(name, symbol, timeframe)
-            df = calculate_indicators(df)
-            res = signal_engine(df)
-            res["price"] = float(df["close"].iloc[-1])
+            df = fetch_ohlcv_df(name, clean_symbol, timeframe)
+            df_ind = add_indicators(df)
+            res = evaluate_signal(df_ind, min_score=min_score)
             results[name] = res
-            dfs[name] = df
+            dfs[name] = df_ind
         except Exception as e:
             results[name] = {"error": f"[{type(e).__name__}] {e}"}
 
+    active = [name for name, r in results.items() if "error" not in r]
     votes = {"LONG": 0, "SHORT": 0, "WAIT": 0}
-    active_exchanges = 0
-    for _, r in results.items():
-        if "error" in r:
-            continue
-        active_exchanges += 1
-        votes[r.get("signal", "WAIT")] += 1
+    for name in active:
+        votes[results[name].get("signal", "WAIT")] += 1
 
-    if active_exchanges == 0:
+    if len(active) == 0:
         final = "WAIT"
-        status_note = "تعذر الاتصال بجميع المنصات"
-    elif active_exchanges == 1:
+        note = "تعذر الاتصال بجميع المنصات حالياً"
+    elif len(active) == 1:
         if votes["LONG"] == 1:
             final = "LONG"
-            status_note = "إشارة معتمدة على منصة واحدة متاحة (حذر)"
+            note = f"إشارة من منصة واحدة متاحة ({active[0].upper()}) — يُنصح بإدارة مخاطر صارمة"
         elif votes["SHORT"] == 1:
             final = "SHORT"
-            status_note = "إشارة معتمدة على منصة واحدة متاحة (حذر)"
+            note = f"إشارة من منصة واحدة متاحة ({active[0].upper()}) — يُنصح بإدارة مخاطر صارمة"
         else:
             final = "WAIT"
-            status_note = "منصة واحدة متاحة وحالتها انتظار (WAIT)"
+            note = f"منصة واحدة متاحة ({active[0].upper()}) وحالتها انتظار"
     else:
-        min_votes = 2
-        if votes["LONG"] >= min_votes and votes["LONG"] > votes["SHORT"]:
+        needed = 2
+        if votes["LONG"] >= needed and votes["LONG"] > votes["SHORT"]:
             final = "LONG"
-            status_note = f"توافق {votes['LONG']} من {active_exchanges} منصات"
-        elif votes["SHORT"] >= min_votes and votes["SHORT"] > votes["LONG"]:
+            note = f"توافق {votes['LONG']} من {len(active)} منصات"
+        elif votes["SHORT"] >= needed and votes["SHORT"] > votes["LONG"]:
             final = "SHORT"
-            status_note = f"توافق {votes['SHORT']} من {active_exchanges} منصات"
+            note = f"توافق {votes['SHORT']} من {len(active)} منصات"
         else:
             final = "WAIT"
-            status_note = "لا يوجد إجماع كافٍ بين المنصات المتاحة"
+            note = "لا يوجد إجماع كافٍ بين المنصات المتاحة"
 
-    same = [r for r in results.values() if r.get("signal") == final and "error" not in r]
-    if same and final != "WAIT":
+    agreeing = [r for r in results.values() if "error" not in r and r.get("signal") == final]
+    if agreeing and final != "WAIT":
         levels = {
-            "entry": float(np.mean([r["price"] for r in same])),
-            "stop_loss": float(np.mean([r["stop_loss"] for r in same])),
-            "tp1": float(np.mean([r["tp1"] for r in same])),
-            "tp2": float(np.mean([r["tp2"] for r in same])),
-            "tp3": float(np.mean([r["tp3"] for r in same])),
-            "rr": float(np.mean([r["rr"] for r in same])),
+            "entry": float(np.mean([r["entry"] for r in agreeing])),
+            "stop_loss": float(np.mean([r["stop_loss"] for r in agreeing])),
+            "tp1": float(np.mean([r["tp1"] for r in agreeing])),
+            "tp2": float(np.mean([r["tp2"] for r in agreeing])),
+            "tp3": float(np.mean([r["tp3"] for r in agreeing])),
+            "rr": float(np.mean([r["rr"] for r in agreeing])),
+            "confidence": float(np.mean([r["confidence"] for r in agreeing])),
+            "score": int(round(np.mean([r["score"] for r in agreeing]))),
         }
+        reasons = agreeing[0].get("reasons", [])
     else:
         levels = None
+        best = max(
+            [r for r in results.values() if "error" not in r],
+            key=lambda x: x.get("score", 0),
+            default={},
+        )
+        reasons = best.get("reasons", [])
 
     return {
-        "symbol": symbol,
+        "symbol": clean_symbol,
         "timeframe": timeframe,
         "votes": votes,
-        "active_exchanges": active_exchanges,
-        "status_note": status_note,
+        "active_count": len(active),
+        "note": note,
         "final": final,
         "levels": levels,
+        "reasons": reasons,
         "details": results,
         "dfs": dfs,
     }
 
 
 # ============================================================
-#               مسح السوق ببديل تلقائي آمن
+#               مسح جميع / أفضل عملات الفيوتشر
 # ============================================================
-def scan_top_symbols(top_n=20, timeframe="1h"):
-    tickers = {}
-    markets = {}
+@st.cache_data(ttl=120, show_spinner=False)
+def get_futures_universe(scan_all: bool = False, top_n: int = 40):
     source_used = None
+    markets = {}
+    tickers = {}
 
-    for ex_name in ["okx", "binance", "bybit"]:
+    for ex_name in ["okx", "bybit", "binance"]:
         try:
             ex = EXCHANGES[ex_name]
             markets = ex.load_markets()
@@ -312,154 +371,210 @@ def scan_top_symbols(top_n=20, timeframe="1h"):
     if not source_used or not markets:
         return [], None
 
-    swap_symbols = [
-        s for s, m in markets.items()
-        if m.get("swap") and (s.endswith("/USDT:USDT") or s.endswith("-USDT-SWAP"))
-    ]
+    usdt_swaps = []
+    for raw_sym, m in markets.items():
+        if not m.get("swap"):
+            continue
+        if raw_sym.endswith("/USDT:USDT"):
+            clean = raw_sym.split(":")[0]
+        elif raw_sym.endswith("-USDT-SWAP"):
+            clean = raw_sym.replace("-USDT-SWAP", "/USDT")
+        else:
+            continue
 
-    top_symbols = sorted(
-        swap_symbols,
-        key=lambda s: tickers.get(s, {}).get("quoteVolume", 0) or 0,
-        reverse=True,
-    )[:top_n]
+        vol = tickers.get(raw_sym, {}).get("quoteVolume") or tickers.get(clean, {}).get("quoteVolume") or 0.0
+        usdt_swaps.append((clean, float(vol)))
+
+    # إزالة التكرار مع الإبقاء على أعلى حجم تداول
+    best_vol = {}
+    for sym, vol in usdt_swaps:
+        if sym not in best_vol or vol > best_vol[sym]:
+            best_vol[sym] = vol
+
+    sorted_syms = sorted(best_vol.items(), key=lambda x: x[1], reverse=True)
+    if scan_all:
+        selected = [s for s, _ in sorted_syms]
+    else:
+        selected = [s for s, _ in sorted_syms[:top_n]]
+
+    return selected, source_used
+
+
+def scan_market_opportunities(
+    timeframe: str,
+    scan_all: bool = False,
+    top_n: int = 40,
+    min_score: int = 6,
+    signal_filter: str = "الكل",
+    min_confidence: float = 60.0,
+):
+    symbols, source_used = get_futures_universe(scan_all=scan_all, top_n=top_n)
+    if not symbols:
+        return [], source_used, 0
 
     opportunities = []
-    for raw_sym in top_symbols:
+    progress = st.progress(0.0, text="جاري فحص أزواج الفيوتشر...")
+    total = len(symbols)
+
+    for idx, sym in enumerate(symbols, 1):
         try:
-            if "-USDT-SWAP" in raw_sym:
-                clean_sym = raw_sym.replace("-USDT-SWAP", "/USDT")
-            else:
-                clean_sym = raw_sym.split(":")[0]
-            r = analyze_multi(clean_sym, timeframe)
-            if r["final"] != "WAIT" and r["levels"]:
-                opportunities.append(r)
+            r = analyze_symbol_multi(sym, timeframe, min_score=min_score)
+            final = r["final"]
+            if final != "WAIT" and r["levels"]:
+                conf = r["levels"]["confidence"]
+                passes_type = (
+                    signal_filter == "الكل"
+                    or (signal_filter == "LONG فقط" and final == "LONG")
+                    or (signal_filter == "SHORT فقط" and final == "SHORT")
+                )
+                if passes_type and conf >= min_confidence:
+                    opportunities.append({
+                        "العملة": r["symbol"],
+                        "الإشارة": final,
+                        "الثقة %": conf,
+                        "النقاط": r["levels"]["score"],
+                        "التصويت": f"L:{r['votes']['LONG']} / S:{r['votes']['SHORT']}",
+                        "الدخول": r["levels"]["entry"],
+                        "وقف الخسارة": r["levels"]["stop_loss"],
+                        "الهدف 1": r["levels"]["tp1"],
+                        "الهدف 2": r["levels"]["tp2"],
+                        "الهدف 3": r["levels"]["tp3"],
+                        "R:R": round(r["levels"]["rr"], 2),
+                    })
         except Exception:
-            continue
-        time.sleep(0.15)
+            pass
+        progress.progress(idx / total, text=f"فحص {idx} من {total}: {sym}")
+        time.sleep(0.08)
 
-    opportunities.sort(key=lambda x: x["votes"].get(x["final"], 0), reverse=True)
-    return opportunities, source_used
+    progress.empty()
+    opportunities.sort(key=lambda x: (x["الثقة %"], x["R:R"]), reverse=True)
+    return opportunities, source_used, total
 
 
 # ============================================================
-#                   أدوات العرض
+#                   العرض والرسوم البيانية
 # ============================================================
-def fmt_price(p):
-    if p is None:
+def fmt_p(val):
+    if val is None or (isinstance(val, float) and np.isnan(val)):
         return "-"
-    if p >= 1000:
-        return f"{p:,.2f}"
-    if p >= 1:
-        return f"{p:.4f}"
-    return f"{p:.6f}"
+    if val >= 1000:
+        return f"{val:,.2f}"
+    if val >= 1:
+        return f"{val:.4f}"
+    return f"{val:.6f}"
 
 
-def render_exchange_cards(result):
-    for name, d in result["details"].items():
-        if "error" in d:
-            with st.expander(f"{name.upper()} — ERROR", expanded=False):
-                st.error(d["error"])
-        else:
-            sig = d.get("signal", "WAIT")
-            score = d.get("score", 0)
-            with st.expander(f"{name.upper()} — {sig}", expanded=(sig != "WAIT")):
-                st.write(f"النقاط: {score}")
-                if sig != "WAIT":
-                    st.write(
-                        f"السعر: {fmt_price(d['price'])} | "
-                        f"SL: {fmt_price(d['stop_loss'])} | "
-                        f"TP1: {fmt_price(d['tp1'])} | "
-                        f"TP2: {fmt_price(d['tp2'])} | "
-                        f"TP3: {fmt_price(d['tp3'])} | "
-                        f"R:R = 1:{d['rr']:.2f}"
-                    )
+def render_signal_card(res: dict, leverage: int, position_size: float):
+    final = res["final"]
+    votes = res["votes"]
 
-
-def render_signal_summary(result, leverage, position_size):
-    final = result["final"]
-    votes = result["votes"]
-
-    st.subheader(f"{result['symbol']} — فريم {result['timeframe']}")
-    st.caption(
-        f"تصويت: LONG={votes['LONG']} | SHORT={votes['SHORT']} | WAIT={votes['WAIT']} "
-        f"— {result['status_note']}"
-    )
+    st.markdown(f"### {res['symbol']} — فريم `{res['timeframe']}`")
+    st.caption(f"تصويت: LONG={votes['LONG']} | SHORT={votes['SHORT']} | WAIT={votes['WAIT']} — {res['note']}")
 
     if final == "LONG":
-        st.success("LONG")
+        st.success("إشارة دخول شراء (LONG)")
     elif final == "SHORT":
-        st.error("SHORT")
+        st.error("إشارة دخول بيع (SHORT)")
     else:
-        st.warning("WAIT")
+        st.warning("حالة انتظار (WAIT) — لم تكتمل شروط الدخول عالية الدقة بعد")
 
-    render_exchange_cards(result)
-
-    if result["levels"]:
-        L = result["levels"]
+    if res["levels"]:
+        L = res["levels"]
         entry = L["entry"]
         sl = L["stop_loss"]
         tp1 = L["tp1"]
         tp2 = L["tp2"]
         tp3 = L["tp3"]
 
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("الدخول", fmt_price(entry))
-        c2.metric("وقف الخسارة (SL)", fmt_price(sl))
-        c3.metric("الهدف 2 (TP2)", fmt_price(tp2))
-        c4.metric("R:R", f"1:{L['rr']:.2f}")
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("نسبة الثقة", f"{L['confidence']:.1f}%")
+        m2.metric("سعر الدخول", fmt_p(entry))
+        m3.metric("وقف الخسارة (SL)", fmt_p(sl))
+        m4.metric("الهدف 2 (TP2)", fmt_p(tp2))
+        m5.metric("نسبة R:R", f"1:{L['rr']:.2f}")
 
-        st.write(f"الأهداف: TP1 = {fmt_price(tp1)} | TP2 = {fmt_price(tp2)} | TP3 = {fmt_price(tp3)}")
+        t1, t2, t3 = st.columns(3)
+        t1.info(f"**الهدف الأول (TP1 — قريب):** `{fmt_p(tp1)}`")
+        t2.info(f"**الهدف الثاني (TP2 — رئيسي):** `{fmt_p(tp2)}`")
+        t3.info(f"**الهدف الثالث (TP3 — ممتد):** `{fmt_p(tp3)}`")
 
         if final == "LONG":
-            pnl_sl_pct = (sl - entry) / entry * 100 * leverage
-            pnl_tp2_pct = (tp2 - entry) / entry * 100 * leverage
+            sl_pct = (sl - entry) / entry * 100.0 * leverage
+            tp1_pct = (tp1 - entry) / entry * 100.0 * leverage
+            tp2_pct = (tp2 - entry) / entry * 100.0 * leverage
+            tp3_pct = (tp3 - entry) / entry * 100.0 * leverage
         else:
-            pnl_sl_pct = (entry - sl) / entry * 100 * leverage
-            pnl_tp2_pct = (entry - tp2) / entry * 100 * leverage
+            sl_pct = (entry - sl) / entry * 100.0 * leverage
+            tp1_pct = (entry - tp1) / entry * 100.0 * leverage
+            tp2_pct = (entry - tp2) / entry * 100.0 * leverage
+            tp3_pct = (entry - tp3) / entry * 100.0 * leverage
 
-        est_loss_usdt = position_size * (pnl_sl_pct / 100.0)
-        est_profit_usdt = position_size * (pnl_tp2_pct / 100.0)
+        est_loss = position_size * (sl_pct / 100.0)
+        est_tp2 = position_size * (tp2_pct / 100.0)
 
-        st.info(
-            f"الرافعة: {leverage}x | حجم المركز: {position_size:.2f} USDT | "
-            f"تأثير SL: {pnl_sl_pct:+.2f}% ({est_loss_usdt:+.2f} USDT) | "
-            f"تأثير TP2: {pnl_tp2_pct:+.2f}% ({est_profit_usdt:+.2f} USDT)"
+        st.write(
+            f"**تقدير الصفقة (رافعة {leverage}x | مركز {position_size:.2f} USDT):** "
+            f"وقف الخسارة `{sl_pct:+.2f}%` (`{est_loss:+.2f} USDT`) | "
+            f"TP1 `{tp1_pct:+.2f}%` | "
+            f"TP2 `{tp2_pct:+.2f}%` (`{est_tp2:+.2f} USDT`) | "
+            f"TP3 `{tp3_pct:+.2f}%`"
         )
 
-    for _, d in result["details"].items():
-        if "error" not in d and d.get("signal") == final and d.get("reasons"):
-            st.markdown("**الأسباب:**")
-            for reason in d["reasons"][:5]:
-                st.write(f"- {reason}")
-            break
+    if res["reasons"]:
+        with st.expander("المؤشرات والأسباب الفنية الداعمة", expanded=(final != "WAIT")):
+            for rsn in res["reasons"]:
+                st.write(f"- {rsn}")
+
+    with st.expander("حالة المنصات وتفاصيل الاتصال", expanded=False):
+        for ex_name, d in res["details"].items():
+            if "error" in d:
+                st.error(f"**{ex_name.upper()}:** {d['error']}")
+            else:
+                st.write(
+                    f"**{ex_name.upper()}:** `{d.get('signal')}` | "
+                    f"الثقة: `{d.get('confidence', 0):.1f}%` | "
+                    f"السعر: `{fmt_p(d.get('price'))}`"
+                )
 
 
-def render_chart(result):
-    dfs = result.get("dfs", {})
+def render_candlestick(res: dict):
+    dfs = res.get("dfs", {})
     df = dfs.get("okx") or dfs.get("bybit") or dfs.get("binance")
     if df is None or df.empty:
-        st.warning("لا توجد بيانات متاحة لرسم الشارت حالياً.")
+        st.warning("لا توجد بيانات كافية لرسم الشارت.")
         return
 
-    tail = df.tail(150)
+    sub = df.tail(140)
     fig = go.Figure()
     fig.add_trace(
         go.Candlestick(
-            x=tail["timestamp"],
-            open=tail["open"],
-            high=tail["high"],
-            low=tail["low"],
-            close=tail["close"],
+            x=sub["timestamp"],
+            open=sub["open"],
+            high=sub["high"],
+            low=sub["low"],
+            close=sub["close"],
             name="السعر",
         )
     )
-    fig.add_trace(go.Scatter(x=tail["timestamp"], y=tail["ema20"], name="EMA 20", mode="lines"))
-    fig.add_trace(go.Scatter(x=tail["timestamp"], y=tail["ema50"], name="EMA 50", mode="lines"))
-    fig.add_trace(go.Scatter(x=tail["timestamp"], y=tail["ema200"], name="EMA 200", mode="lines"))
+    fig.add_trace(go.Scatter(x=sub["timestamp"], y=sub["ema20"], name="EMA 20", mode="lines"))
+    fig.add_trace(go.Scatter(x=sub["timestamp"], y=sub["ema50"], name="EMA 50", mode="lines"))
+    fig.add_trace(go.Scatter(x=sub["timestamp"], y=sub["ema200"], name="EMA 200", mode="lines"))
+
+    if res.get("levels"):
+        L = res["levels"]
+        for label, val, style in [
+            ("Entry", L["entry"], "dot"),
+            ("Stop Loss", L["stop_loss"], "dash"),
+            ("TP1", L["tp1"], "dash"),
+            ("TP2", L["tp2"], "solid"),
+            ("TP3", L["tp3"], "dot"),
+        ]:
+            fig.add_hline(y=val, line_dash=style, annotation_text=f"{label}: {fmt_p(val)}")
+
     fig.update_layout(
-        title=f"{result['symbol']} ({result['timeframe']})",
+        title=f"{res['symbol']} — فريم {res['timeframe']}",
         xaxis_rangeslider_visible=False,
-        height=480,
+        height=500,
     )
     st.plotly_chart(fig, use_container_width=True)
 
@@ -467,54 +582,89 @@ def render_chart(result):
 # ============================================================
 #                   الواجهة الرئيسية
 # ============================================================
-st.title("Scanner Pro")
-st.caption("Binance + Bybit + OKX — v2.0")
+st.title("Futures Signal Scanner Pro v3.0")
+st.caption("تحليل عقود الفيوتشر متعددة الفريمات • بحث شامل في العملات • إشارات دخول ووقف وأهداف")
 
 with st.sidebar:
-    st.header("الإعدادات")
+    st.header("إعدادات التحليل")
     mode = st.radio(
-        "الوضع",
-        ["تحليل عملة", "مسح السوق", "رسم بياني"],
+        "اختر الوضع",
+        ["تحليل عملة محددة", "بحث في كل العملات", "رسم بياني + مستويات"],
         index=0,
     )
-    timeframe = st.selectbox("الفريم", ["15m", "1h", "4h"], index=1)
-    leverage = st.slider("الليفرج", min_value=1, max_value=100, value=32)
+    timeframe = st.selectbox("اختر الفريم", TIMEFRAMES, index=3)  # الافتراضي 1h
+    min_score = st.slider("حد الدقة / النقاط المطلوبة للإشارة", min_value=4, max_value=9, value=6)
+    min_confidence = st.slider("الحد الأدنى لنسبة الثقة %", min_value=50, max_value=90, value=65, step=5)
+
+    st.divider()
+    st.subheader("إدارة المخاطر (للحساب التقديري)")
+    leverage = st.slider("الرافعة المالية (Leverage)", min_value=1, max_value=125, value=20)
     position_size = st.number_input("حجم المركز (USDT)", min_value=10.0, value=100.0, step=10.0)
-    symbol = st.text_input("العملة", value="BTC/USDT")
-    top_n = st.slider("عدد العملات في مسح السوق", min_value=10, max_value=40, value=20, step=5)
 
-run_btn = st.button("تحليل", type="primary", use_container_width=True)
+    if mode in ("تحليل عملة محددة", "رسم بياني + مستويات"):
+        symbol_input = st.text_input("اسم العملة (أي عملة مثلاً BTC, ETH, SOL, XRP, DOGE)", value="BTC/USDT")
+    else:
+        symbol_input = "BTC/USDT"
 
-if mode in ("تحليل عملة", "رسم بياني"):
-    if run_btn or "last_single_result" not in st.session_state:
-        with st.spinner("جاري تحليل العملة..."):
-            st.session_state["last_single_result"] = analyze_multi(symbol, timeframe)
+    if mode == "بحث في كل العملات":
+        scan_all = st.checkbox("فحص كل العملات المتاحة في السوق (قد يستغرق وقتاً أطول)", value=False)
+        top_n = st.slider("عدد العملات الأعلى سيولة عند عدم فحص الكل", min_value=20, max_value=150, value=50, step=10)
+        signal_filter = st.selectbox("تصفية الإشارات", ["الكل", "LONG فقط", "SHORT فقط"], index=0)
+    else:
+        scan_all = False
+        top_n = 50
+        signal_filter = "الكل"
 
-    res = st.session_state["last_single_result"]
-    render_signal_summary(res, leverage, position_size)
-    if mode == "رسم بياني":
-        render_chart(res)
+run_clicked = st.button("تشغيل التحليل / البحث الآن", type="primary", use_container_width=True)
 
-elif mode == "مسح السوق":
-    if run_btn:
-        with st.spinner("جاري مسح السوق..."):
-            opps, source_used = scan_top_symbols(top_n=top_n, timeframe=timeframe)
-            st.session_state["last_scan"] = (opps, source_used)
+if mode in ("تحليل عملة محددة", "رسم بياني + مستويات"):
+    key_sig = f"{symbol_input}|{timeframe}|{min_score}"
+    if run_clicked or st.session_state.get("single_key") != key_sig:
+        with st.spinner(f"جاري تحليل {normalize_input_symbol(symbol_input)} على فريم {timeframe}..."):
+            st.session_state["single_result"] = analyze_symbol_multi(
+                symbol_input, timeframe, min_score=min_score
+            )
+            st.session_state["single_key"] = key_sig
 
-    if "last_scan" in st.session_state:
-        opps, source_used = st.session_state["last_scan"]
-        if source_used:
-            st.caption(f"مصدر قائمة العملات: {source_used.upper()} — عدد الفرص المكتشفة: {len(opps)}")
+    res = st.session_state.get("single_result")
+    if res:
+        render_signal_card(res, leverage, position_size)
+        if mode == "رسم بياني + مستويات":
+            render_candlestick(res)
+
+elif mode == "بحث في كل العملات":
+    if run_clicked:
+        opps, src, scanned_count = scan_market_opportunities(
+            timeframe=timeframe,
+            scan_all=scan_all,
+            top_n=top_n,
+            min_score=min_score,
+            signal_filter=signal_filter,
+            min_confidence=float(min_confidence),
+        )
+        st.session_state["scan_pack"] = (opps, src, scanned_count, timeframe)
+
+    if "scan_pack" in st.session_state:
+        opps, src, scanned_count, tf_used = st.session_state["scan_pack"]
+        st.caption(
+            f"المصدر: `{(src or 'غير متاح').upper()}` | "
+            f"الفريم: `{tf_used}` | "
+            f"العملات المفحوصة: `{scanned_count}` | "
+            f"الفرص المطابقة: `{len(opps)}`"
+        )
         if not opps:
-            st.info("لا توجد فرص مكتملة حالياً على الإعدادات المختارة.")
+            st.info("لم يتم العثور على فرص تحقق شروط الدقة والثقة الحالية على هذا الفريم. جرّب فريم آخر أو خفّض نسبة الثقة قليلاً.")
         else:
-            for idx, opp in enumerate(opps, 1):
-                L = opp["levels"]
-                st.markdown(
-                    f"**{idx}. {opp['symbol']} — {opp['final']}** | "
-                    f"الدخول: `{fmt_price(L['entry'])}` | "
-                    f"SL: `{fmt_price(L['stop_loss'])}` | "
-                    f"TP2: `{fmt_price(L['tp2'])}` | "
-                    f"R:R: `1:{L['rr']:.2f}` | "
-                    f"التصويت: `LONG={opp['votes']['LONG']}, SHORT={opp['votes']['SHORT']}`"
-                )
+            df_opps = pd.DataFrame(opps)
+            for col in ["الدخول", "وقف الخسارة", "الهدف 1", "الهدف 2", "الهدف 3"]:
+                df_opps[col] = df_opps[col].apply(fmt_p)
+            st.dataframe(df_opps, use_container_width=True, hide_index=True)
+
+            selected_coin = st.selectbox(
+                "اختر عملة من النتائج لعرض تفاصيلها الكاملة والشارت:",
+                options=[row["العملة"] for row in opps],
+            )
+            if selected_coin and st.button("عرض تفاصيل العملة المختارة"):
+                detail_res = analyze_symbol_multi(selected_coin, tf_used, min_score=min_score)
+                render_signal_card(detail_res, leverage, position_size)
+                render_candlestick(detail_res)
