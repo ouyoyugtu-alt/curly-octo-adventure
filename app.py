@@ -10,29 +10,60 @@ st.set_page_config(
     layout="wide",
 )
 
+# --- تنسيق RTL وتحسين العرض على الجوال ---
+st.markdown("""
+<style>
+    .stApp, .stMarkdown, .stSelectbox, .stSlider, .stNumberInput, .stTextInput {
+        direction: rtl;
+        text-align: right;
+    }
+    @media (max-width: 768px) {
+        [data-testid="stSidebar"] {
+            width: 85vw !important;
+            min-width: 85vw !important;
+        }
+    }
+</style>
+""", unsafe_allow_html=True)
+
 st.title("🐋 أداة رصد السيولة وحساب الأهداف ووقف الخسارة (العقود الآجلة)")
 st.caption(
     "تنبيه: هذه الأداة تحليلية لمساعدتك في رصد قفزات الحجم وبناء إدارة المخاطر؛ وليست توصية استثمارية أو ضماناً للربح."
 )
 
-# --- الشريط الجانبي للإعدادات ---
-st.sidebar.header("⚙️ إعدادات الفحص والرمز")
+# --- الشريط الجانبي: البحث والإعدادات ---
+st.sidebar.header("⚙️ إعدادات الفحص والبحث")
 
-preset_symbols = {
+st.sidebar.subheader("🔎 البحث عن عملة أو رمز")
+quick_picks = {
+    "بحث حر (اكتب أي عملة بالأسفل)": "",
+    "بيتكوين (BTC-USD)": "BTC-USD",
+    "إيثيريوم (ETH-USD)": "ETH-USD",
+    "سولانا (SOL-USD)": "SOL-USD",
+    "ريبل (XRP-USD)": "XRP-USD",
     "عقود S&P 500 الآجلة (ES=F)": "ES=F",
     "عقود Nasdaq الآجلة (NQ=F)": "NQ=F",
     "الذهب الآجل (GC=F)": "GC=F",
     "النفط الخام الآجل (CL=F)": "CL=F",
-    "بيتكوين الآجل (BTC-USD)": "BTC-USD",
-    "إيثيريوم الآجل (ETH-USD)": "ETH-USD",
-    "رمز مخصص": "CUSTOM",
 }
 
-choice = st.sidebar.selectbox("اختر الأصل / العقد", list(preset_symbols.keys()))
-if preset_symbols[choice] == "CUSTOM":
-    symbol = st.sidebar.text_input("أدخل رمز الأصل (مثال: SI=F أو SOL-USD)", value="GC=F").strip()
+selected_quick = st.sidebar.selectbox("اختيار سريع (اختياري)", list(quick_picks.keys()))
+default_symbol = quick_picks[selected_quick] if quick_picks[selected_quick] else "BTC-USD"
+
+raw_query = st.sidebar.text_input(
+    "اكتب رمز العملة أو الزوج للبحث",
+    value=default_symbol,
+    placeholder="مثال: SOL أو AVAX-USD أو EURUSD=X",
+    help="للعملات الرقمية في Yahoo Finance يمكن كتابة الرمز مثل SOL أو بصيغة SOL-USD"
+).strip().upper()
+
+# تنسيق تلقائي إذا كتب المستخدم رمز عملة رقمية بدون لاحقة مثل BTC أو SOL
+if raw_query and "-" not in raw_query and "=" not in raw_query and not raw_query.endswith("USD"):
+    symbol = f"{raw_query}-USD"
 else:
-    symbol = preset_symbols[choice]
+    symbol = raw_query or "BTC-USD"
+
+st.sidebar.caption(f"الرمز الفعلي قيد الفحص: `{symbol}`")
 
 interval = st.sidebar.selectbox("الفاصل الزمني", ["15m", "1h", "4h", "1d"], index=1)
 period = st.sidebar.selectbox("فترة البيانات التاريخية", ["5d", "1mo", "3mo", "6mo", "1y"], index=1)
@@ -62,7 +93,6 @@ def generate_demo_data(n=200, seed=42):
     open_p[0] = close[0]
     volume = rng.integers(800, 3500, size=n).astype(float)
 
-    # حقن بعض إشارات الحيتان الواضحة
     for idx in [45, 92, 148, 185]:
         if idx < n:
             direction = 1 if idx % 2 == 0 else -1
@@ -97,7 +127,6 @@ def analyze_whales(df: pd.DataFrame):
     data["Vol_SMA"] = data["Volume"].rolling(vol_window).mean()
     data["Vol_Ratio"] = data["Volume"] / data["Vol_SMA"].replace(0, np.nan)
 
-    # حساب True Range و ATR
     prev_close = data["Close"].shift(1)
     tr = pd.concat([
         data["High"] - data["Low"],
@@ -106,16 +135,17 @@ def analyze_whales(df: pd.DataFrame):
     ], axis=1).max(axis=1)
     data["ATR"] = tr.rolling(atr_period).mean()
 
-    # تحديد الاتجاه بناءً على إغلاق الشمعة
     data["Direction"] = np.where(
         data["Close"] > data["Open"], "شراء (Long)",
         np.where(data["Close"] < data["Open"], "بيع (Short)", "محايد")
     )
 
-    # رصد إشارة الحوت عند قفزة الحجم ووجود ATR صالح
-    data["Whale_Signal"] = (data["Vol_Ratio"] >= vol_multiplier) & (data["Direction"] != "محايد") & data["ATR"].notna()
+    data["Whale_Signal"] = (
+        (data["Vol_Ratio"] >= vol_multiplier)
+        & (data["Direction"] != "محايد")
+        & data["ATR"].notna()
+    )
 
-    # حساب مستويات الدخول والوقف والأهداف لكل شمعة
     risk_dist = data["ATR"] * sl_atr_mult
     data["Entry"] = data["Close"]
 
@@ -156,13 +186,16 @@ if raw_df.empty:
         raw_df = generate_demo_data()
         source_label = "بيانات تجريبية (Demo)"
     else:
-        st.error("تعذر جلب البيانات للرمز المحدد. جرّب رمزاً آخر أو فعّل البيانات التجريبية من الشريط الجانبي.")
+        st.error(f"تعذر جلب البيانات للرمز `{symbol}`. جرّب رمزاً آخر أو فعّل البيانات التجريبية من الشريط الجانبي.")
         st.stop()
 
 df_analyzed = analyze_whales(raw_df)
 signals = df_analyzed[df_analyzed["Whale_Signal"]].copy()
 
-st.info(f"المصدر الحالي: **{source_label}** | عدد الشموع المحللة: **{len(df_analyzed)}** | إشارات الحيتان المرصودة: **{len(signals)}**")
+st.info(
+    f"الرمز: **`{symbol}`** | المصدر: **{source_label}** | "
+    f"الشموع المحللة: **{len(df_analyzed)}** | إشارات الحيتان: **{len(signals)}**"
+)
 
 # --- عرض أحدث إشارة حوت ---
 if not signals.empty:
@@ -171,15 +204,15 @@ if not signals.empty:
 
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("نوع الإشارة", str(latest["Direction"]))
-    c2.metric("سعر الدخول التقريبي", f"{latest['Entry']:.2f}")
-    c3.metric("وقف الخسارة (SL)", f"{latest['Stop_Loss']:.2f}")
-    c4.metric(f"الهدف الأول (TP1 - {tp1_rr}R)", f"{latest['TP1']:.2f}")
-    c5.metric(f"الهدف الثاني (TP2 - {tp2_rr}R)", f"{latest['TP2']:.2f}")
+    c2.metric("سعر الدخول التقريبي", f"{latest['Entry']:.4f}")
+    c3.metric("وقف الخسارة (SL)", f"{latest['Stop_Loss']:.4f}")
+    c4.metric(f"الهدف الأول (TP1 - {tp1_rr}R)", f"{latest['TP1']:.4f}")
+    c5.metric(f"الهدف الثاني (TP2 - {tp2_rr}R)", f"{latest['TP2']:.4f}")
 
     risk_amount = account_size * (risk_pct / 100.0)
     st.markdown(
         f"- **مضاعف الحجم:** `{latest['Vol_Ratio']:.2f}x` من متوسط آخر `{vol_window}` شموع\n"
-        f"- **قيمة ATR الحالية:** `{latest['ATR']:.2f}` | **مسافة الوقف:** `{latest['Risk_Per_Unit']:.2f}`\n"
+        f"- **قيمة ATR الحالية:** `{latest['ATR']:.4f}` | **مسافة الوقف:** `{latest['Risk_Per_Unit']:.4f}`\n"
         f"- **الحد الأقصى للمخاطرة في الصفقة:** `${risk_amount:,.2f}` | **حجم الوحدات/العقود التقديري:** `{latest['Suggested_Units']:.2f}`"
     )
 else:
@@ -219,8 +252,6 @@ if not signals.empty:
         name="إشارة بيع (حجم مرتفع)"
     ))
 
-    # رسم خطوط SL و TP1 و TP2 لآخر إشارة فقط لتوضيح الصورة
-    last_idx = signals.index[-1]
     last_row = signals.iloc[-1]
     fig.add_hline(y=last_row["Stop_Loss"], line_dash="dash", line_color="red", annotation_text="SL")
     fig.add_hline(y=last_row["TP1"], line_dash="dot", line_color="green", annotation_text="TP1")
@@ -240,10 +271,10 @@ if not signals.empty:
         "الوقت": signals.index.strftime("%Y-%m-%d %H:%M"),
         "الاتجاه": signals["Direction"].values,
         "مضاعف الحجم": signals["Vol_Ratio"].round(2).values,
-        "الدخول": signals["Entry"].round(2).values,
-        "وقف الخسارة": signals["Stop_Loss"].round(2).values,
-        "الهدف 1": signals["TP1"].round(2).values,
-        "الهدف 2": signals["TP2"].round(2).values,
+        "الدخول": signals["Entry"].round(4).values,
+        "وقف الخسارة": signals["Stop_Loss"].round(4).values,
+        "الهدف 1": signals["TP1"].round(4).values,
+        "الهدف 2": signals["TP2"].round(4).values,
         "حجم مقترح": signals["Suggested_Units"].round(2).values,
     })
     st.dataframe(table_df.iloc[::-1], use_container_width=True, hide_index=True)
