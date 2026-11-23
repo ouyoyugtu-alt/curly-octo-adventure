@@ -1,987 +1,334 @@
-import time
-import numpy as np
-import pandas as pd
-import plotly.graph_objects as go
-import requests
 import streamlit as st
+import pandas as pd
+import numpy as np
+import requests
+import plotly.graph_objects as go
+from datetime import datetime, timezone
 
-# ==========================================
-# GALEIC FUTURES PRO
-# BYBIT V5 API
-# ==========================================
-
-API = "https://api.bybit.com"
-CATEGORY = "linear"
-
-session = requests.Session()
-session.headers.update({
-    "User-Agent": "GALEIC-FUTURES-PRO/2.0"
-})
-
+# -------------------- إعدادات عامة --------------------
 st.set_page_config(
     page_title="GALEIC FUTURES PRO",
-    page_icon="📊",
-    layout="wide"
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="collapsed",
 )
+
+BASE_URL = "https://fapi.binance.com"
+INTERVALS = ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w"]
+INTERVAL_LABELS = {
+    "1m": "1 دقيقة", "3m": "3 دقائق", "5m": "5 دقائق", "15m": "15 دقيقة",
+    "30m": "30 دقيقة", "1h": "1 ساعة", "2h": "ساعتان", "4h": "4 ساعات",
+    "6h": "6 ساعات", "8h": "8 ساعات", "12h": "12 ساعة", "1d": "يومي",
+    "3d": "3 أيام", "1w": "أسبوعي"
+}
 
 st.markdown("""
 <style>
-html, body, [class*="css"] {
-    direction: rtl;
-}
-[data-testid="stAppViewContainer"] {
-    background: #08111f;
-}
-[data-testid="stSidebar"] {
-    background: #101b2b;
-}
-.block-container {
-    padding-top: 1.2rem;
-}
-div[data-testid="stMetric"] {
-    background: #111f33;
-    border: 1px solid #263b57;
-    padding: 12px;
-    border-radius: 12px;
-}
+@import url('https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;800&display=swap');
+html, body, [class*="css"] {font-family:'Cairo',sans-serif;}
+.stApp {background: radial-gradient(circle at top right,#14243b 0%,#080d16 42%,#05080e 100%); color:#f4f7fb;}
+.block-container {max-width:1180px; padding-top:1.2rem; padding-bottom:2rem;}
+.hero {background:linear-gradient(120deg,rgba(18,35,58,.96),rgba(8,14,24,.96));border:1px solid #24415f;border-radius:22px;padding:22px 24px;margin-bottom:18px;box-shadow:0 12px 35px rgba(0,0,0,.25);}
+.brand {font-size:clamp(25px,5vw,38px);font-weight:800;letter-spacing:.4px;color:#e8c66a;margin:0;}
+.sub {color:#aebdd0;font-size:14px;margin-top:4px;}
+.panel {background:rgba(14,23,36,.94);border:1px solid #20354d;border-radius:18px;padding:16px 18px;margin:12px 0;}
+.metric {background:linear-gradient(145deg,#13243a,#0c1522);border:1px solid #29425e;border-radius:15px;padding:14px 12px;text-align:center;min-height:88px;}
+.metric-label {font-size:12px;color:#9fb1c6;}
+.metric-value {font-size:clamp(17px,3vw,23px);font-weight:800;color:#f6f8fb;direction:ltr;}
+.gold {color:#e8c66a!important;}
+.buy {color:#20d69a!important;}
+.sell {color:#ff6577!important;}
+.wait {color:#e8c66a!important;}
+.small-note {font-size:12px;color:#9fb1c6;}
+div.stButton > button {border-radius:12px;border:1px solid #d2ad50;background:linear-gradient(90deg,#c99d3d,#f0d27b);color:#111827;font-weight:800;min-height:48px;width:100%;}
+div.stButton > button:hover {border-color:#ffe7a3;color:#000;filter:brightness(1.06);}
+[data-testid="stTextInput"] input,[data-testid="stSelectbox"] div[data-baseweb="select"] {background:#101b2a;color:#fff;border-radius:10px;}
+[data-testid="stAlert"] {border-radius:12px;}
+footer {visibility:hidden;}
+@media(max-width:640px){.block-container{padding-left: .8rem;padding-right:.8rem;padding-top:.7rem}.hero{padding:17px}.panel{padding:13px}.sub{font-size:12px}}
 </style>
 """, unsafe_allow_html=True)
 
-st.title("📊 GALEIC FUTURES PRO")
 
-st.caption(
-    "منصة تحليل عقود Bybit USDT Perpetual "
-    "باستخدام بيانات السوق العامة."
-)
-
-
-# ==========================================
-# API CONNECTION
-# ==========================================
-
-class MarketDataError(Exception):
-    pass
+def api_get(path, params=None, timeout=15):
+    response = requests.get(BASE_URL + path, params=params, timeout=timeout)
+    response.raise_for_status()
+    return response.json()
 
 
-def bybit_get(path, params=None):
-
-    try:
-        response = session.get(
-            API + path,
-            params=params or {},
-            timeout=20
-        )
-
-        if response.status_code in (403, 451):
-            raise MarketDataError(
-                f"رفض مزود البيانات الاتصال: HTTP "
-                f"{response.status_code}. "
-                "قد يكون الوصول مقيداً من منطقة الاستضافة."
-            )
-
-        if response.status_code == 429:
-            raise MarketDataError(
-                "تجاوزت حد الطلبات. حاول بعد قليل."
-            )
-
-        response.raise_for_status()
-        payload = response.json()
-
-    except requests.RequestException as exc:
-        raise MarketDataError(
-            f"خطأ في الاتصال: {exc}"
-        )
-
-    if payload.get("retCode") != 0:
-        raise MarketDataError(
-            payload.get("retMsg", "خطأ من Bybit API")
-        )
-
-    return payload
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_symbols():
+    data = api_get("/fapi/v1/exchangeInfo")
+    symbols = []
+    for item in data.get("symbols", []):
+        if (item.get("quoteAsset") == "USDT"
+            and item.get("contractType") == "PERPETUAL"
+            and item.get("status") == "TRADING"):
+            symbols.append(item["symbol"])
+    return sorted(symbols)
 
 
-# ==========================================
-# MARKET TICKERS
-# ==========================================
-
-@st.cache_data(ttl=45)
-def get_linear_tickers():
-
-    payload = bybit_get(
-        "/v5/market/tickers",
-        {"category": CATEGORY}
-    )
-
-    rows = payload["result"]["list"]
-
-    df = pd.DataFrame(rows)
-
-    if df.empty:
-        raise MarketDataError(
-            "لم يتم العثور على بيانات السوق."
-        )
-
-    for col in [
-        "lastPrice",
-        "volume24h",
-        "turnover24h",
-        "price24hPcnt"
-    ]:
-        df[col] = pd.to_numeric(
-            df[col],
-            errors="coerce"
-        )
-
-    df = df[
-        df["symbol"].str.endswith("USDT", na=False)
-    ].copy()
-
-    return df
-
-
-# ==========================================
-# CANDLE DATA
-# ==========================================
-
-@st.cache_data(ttl=20)
+@st.cache_data(ttl=8, show_spinner=False)
 def get_klines(symbol, interval, limit=300):
+    raw = api_get("/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": limit})
+    cols = ["open_time","open","high","low","close","volume","close_time","quote_volume",
+            "trades","taker_buy_base","taker_buy_quote","ignore"]
+    df = pd.DataFrame(raw, columns=cols)
+    for col in ["open","high","low","close","volume","quote_volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
+    # استبعاد الشمعة الحالية غير المكتملة حتى لا تصدر إشارة قبل الإغلاق
+    now = pd.Timestamp.now(tz="UTC")
+    if len(df) > 1 and df.iloc[-1]["close_time"] > now:
+        df = df.iloc[:-1].copy()
+    return df.dropna().reset_index(drop=True)
 
-    payload = bybit_get(
-        "/v5/market/kline",
-        {
-            "category": CATEGORY,
-            "symbol": symbol,
-            "interval": str(interval),
-            "limit": limit
-        }
-    )
-
-    rows = payload["result"]["list"]
-
-    if not rows:
-        raise MarketDataError(
-            f"لا توجد بيانات للرمز {symbol}"
-        )
-
-    df = pd.DataFrame(
-        rows,
-        columns=[
-            "start_ms",
-            "Open",
-            "High",
-            "Low",
-            "Close",
-            "Volume",
-            "Turnover"
-        ]
-    )
-
-    df["start_ms"] = pd.to_numeric(
-        df["start_ms"]
-    )
-
-    for col in [
-        "Open",
-        "High",
-        "Low",
-        "Close",
-        "Volume",
-        "Turnover"
-    ]:
-        df[col] = pd.to_numeric(
-            df[col],
-            errors="coerce"
-        )
-
-    df["time"] = pd.to_datetime(
-        df["start_ms"],
-        unit="ms",
-        utc=True
-    )
-
-    df = df.dropna()
-
-    df = df.sort_values("time")
-
-    df = df.set_index("time")
-
-    now_ms = int(
-        pd.Timestamp.now(tz="UTC").timestamp() * 1000
-    )
-
-    interval_ms = int(interval) * 60_000
-
-    df = df[
-        (df["start_ms"] + interval_ms) <= now_ms
-    ]
-
-    return df[
-        [
-            "Open",
-            "High",
-            "Low",
-            "Close",
-            "Volume",
-            "Turnover"
-        ]
-    ]
-
-
-# ==========================================
-# TECHNICAL INDICATORS
-# ==========================================
 
 def add_indicators(df):
-
     d = df.copy()
+    close = d["close"]
+    high, low = d["high"], d["low"]
+    d["ema20"] = close.ewm(span=20, adjust=False).mean()
+    d["ema50"] = close.ewm(span=50, adjust=False).mean()
+    d["ema200"] = close.ewm(span=200, adjust=False).mean()
 
-    d["EMA20"] = d["Close"].ewm(
-        span=20,
-        adjust=False
-    ).mean()
+    delta = close.diff()
+    gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
+    rs = gain / loss.replace(0, np.nan)
+    d["rsi"] = 100 - (100 / (1 + rs))
+    d["rsi"] = d["rsi"].fillna(50)
 
-    d["EMA50"] = d["Close"].ewm(
-        span=50,
-        adjust=False
-    ).mean()
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    d["macd"] = ema12 - ema26
+    d["macd_signal"] = d["macd"].ewm(span=9, adjust=False).mean()
+    d["macd_hist"] = d["macd"] - d["macd_signal"]
 
-    d["EMA200"] = d["Close"].ewm(
-        span=200,
-        adjust=False
-    ).mean()
-
-    delta = d["Close"].diff()
-
-    gain = delta.clip(lower=0)
-
-    loss = -delta.clip(upper=0)
-
-    avg_gain = gain.ewm(
-        alpha=1/14,
-        adjust=False,
-        min_periods=14
-    ).mean()
-
-    avg_loss = loss.ewm(
-        alpha=1/14,
-        adjust=False,
-        min_periods=14
-    ).mean()
-
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-
-    d["RSI"] = 100 - (
-        100 / (1 + rs)
-    )
-
-    d.loc[
-        (avg_loss == 0) & (avg_gain > 0),
-        "RSI"
-    ] = 100
-
-    ema12 = d["Close"].ewm(
-        span=12,
-        adjust=False
-    ).mean()
-
-    ema26 = d["Close"].ewm(
-        span=26,
-        adjust=False
-    ).mean()
-
-    d["MACD"] = ema12 - ema26
-
-    d["MACD_SIGNAL"] = d["MACD"].ewm(
-        span=9,
-        adjust=False
-    ).mean()
-
-    previous_close = d["Close"].shift(1)
-
-    tr = pd.concat(
-        [
-            d["High"] - d["Low"],
-            (d["High"] - previous_close).abs(),
-            (d["Low"] - previous_close).abs()
-        ],
-        axis=1
-    ).max(axis=1)
-
-    d["ATR"] = tr.ewm(
-        alpha=1/14,
-        adjust=False,
-        min_periods=14
-    ).mean()
-
-    d["VOL_MA20"] = d["Volume"].rolling(20).mean()
-
-    d["VOL_RATIO"] = (
-        d["Volume"] /
-        d["VOL_MA20"].replace(0, np.nan)
-    )
-
-    return d.dropna(
-        subset=[
-            "EMA200",
-            "RSI",
-            "MACD_SIGNAL",
-            "ATR",
-            "VOL_RATIO"
-        ]
-    )
+    prev_close = close.shift(1)
+    tr = pd.concat([(high-low), (high-prev_close).abs(), (low-prev_close).abs()], axis=1).max(axis=1)
+    d["atr"] = tr.ewm(alpha=1/14, adjust=False).mean()
+    d["vol_sma20"] = d["volume"].rolling(20).mean()
+    d["bb_mid"] = close.rolling(20).mean()
+    bb_std = close.rolling(20).std()
+    d["bb_upper"] = d["bb_mid"] + 2 * bb_std
+    d["bb_lower"] = d["bb_mid"] - 2 * bb_std
+    return d.dropna().reset_index(drop=True)
 
 
-# ==========================================
-# TREND ANALYSIS
-# ==========================================
-
-def get_trend(df):
-
-    x = df.iloc[-1]
-
-    if (
-        x["Close"] > x["EMA20"]
-        and x["EMA20"] > x["EMA50"]
-        and x["EMA50"] > x["EMA200"]
-    ):
-        return "صاعد"
-
-    if (
-        x["Close"] < x["EMA20"]
-        and x["EMA20"] < x["EMA50"]
-        and x["EMA50"] < x["EMA200"]
-    ):
-        return "هابط"
-
-    return "محايد"
-
-
-# ==========================================
-# SIGNAL ENGINE
-# ==========================================
-
-def analyze_symbol(
-    symbol,
-    sl_atr,
-    rr1,
-    rr2,
-    rr3
-):
-
-    d15 = add_indicators(
-        get_klines(symbol, "15", 300)
-    )
-
-    d1 = add_indicators(
-        get_klines(symbol, "60", 300)
-    )
-
-    d4 = add_indicators(
-        get_klines(symbol, "240", 300)
-    )
-
-    if min(len(d15), len(d1), len(d4)) < 5:
-        return None
-
-    x = d15.iloc[-1]
-
-    trend15 = get_trend(d15)
-    trend1 = get_trend(d1)
-    trend4 = get_trend(d4)
-
-    long_score = 0
-    short_score = 0
-
-    if trend4 == "صاعد":
-        long_score += 25
-
-    if trend4 == "هابط":
-        short_score += 25
-
-    if trend1 == "صاعد":
-        long_score += 25
-
-    if trend1 == "هابط":
-        short_score += 25
-
-    if x["Close"] > x["EMA20"]:
-        long_score += 10
-
-    if x["Close"] < x["EMA20"]:
-        short_score += 10
-
-    if 50 < x["RSI"] < 70:
-        long_score += 10
-
-    if 30 < x["RSI"] < 50:
-        short_score += 10
-
-    if x["MACD"] > x["MACD_SIGNAL"]:
-        long_score += 10
-
-    if x["MACD"] < x["MACD_SIGNAL"]:
-        short_score += 10
-
-    if x["VOL_RATIO"] >= 1.5:
-
-        if x["Close"] > x["Open"]:
-            long_score += 10
-
-        elif x["Close"] < x["Open"]:
-            short_score += 10
-
-    previous_high = d15["High"].iloc[-21:-1].max()
-
-    previous_low = d15["Low"].iloc[-21:-1].min()
-
-    if x["Close"] > previous_high:
-        long_score += 10
-
-    if x["Close"] < previous_low:
-        short_score += 10
-
-    signal = "WAIT"
-    score = max(long_score, short_score)
-
-    if (
-        long_score >= 70
-        and long_score > short_score
-        and trend4 == "صاعد"
-        and trend1 == "صاعد"
-    ):
-        signal = "LONG"
-        score = long_score
-
-    elif (
-        short_score >= 70
-        and short_score > long_score
-        and trend4 == "هابط"
-        and trend1 == "هابط"
-    ):
-        signal = "SHORT"
-        score = short_score
-
-    entry = float(x["Close"])
-    atr = float(x["ATR"])
-
+def analyze(df):
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+    close = float(last["close"])
+    atr = float(last["atr"])
     if not np.isfinite(atr) or atr <= 0:
-        return None
+        raise ValueError("تعذر حساب ATR بصورة سليمة.")
 
-    if signal == "LONG":
+    long_checks = [
+        (last["ema20"] > last["ema50"], "EMA20 أعلى من EMA50"),
+        (last["ema50"] > last["ema200"], "EMA50 أعلى من EMA200"),
+        (last["close"] > last["ema20"], "السعر أعلى EMA20"),
+        (last["macd"] > last["macd_signal"], "MACD إيجابي"),
+        (last["rsi"] >= 50 and last["rsi"] < 72, "RSI يدعم الصعود دون تشبع مرتفع"),
+        (last["volume"] > last["vol_sma20"], "حجم التداول أعلى من متوسط 20 شمعة"),
+        (last["close"] > prev["close"], "إغلاق أعلى من الشمعة السابقة"),
+    ]
+    short_checks = [
+        (last["ema20"] < last["ema50"], "EMA20 أسفل EMA50"),
+        (last["ema50"] < last["ema200"], "EMA50 أسفل EMA200"),
+        (last["close"] < last["ema20"], "السعر أسفل EMA20"),
+        (last["macd"] < last["macd_signal"], "MACD سلبي"),
+        (last["rsi"] <= 50 and last["rsi"] > 28, "RSI يدعم الهبوط دون تشبع منخفض"),
+        (last["volume"] > last["vol_sma20"], "حجم التداول أعلى من متوسط 20 شمعة"),
+        (last["close"] < prev["close"], "إغلاق أسفل الشمعة السابقة"),
+    ]
+    long_score = int(round(sum(bool(x[0]) for x in long_checks) / len(long_checks) * 100))
+    short_score = int(round(sum(bool(x[0]) for x in short_checks) / len(short_checks) * 100))
 
-        distance = atr * sl_atr
-
-        sl = entry - distance
-
-        tp1 = entry + distance * rr1
-
-        tp2 = entry + distance * rr2
-
-        tp3 = entry + distance * rr3
-
-    elif signal == "SHORT":
-
-        distance = atr * sl_atr
-
-        sl = entry + distance
-
-        tp1 = entry - distance * rr1
-
-        tp2 = entry - distance * rr2
-
-        tp3 = entry - distance * rr3
-
+    if long_score >= 72 and long_score > short_score:
+        direction, score, checks = "LONG", long_score, long_checks
+    elif short_score >= 72 and short_score > long_score:
+        direction, score, checks = "SHORT", short_score, short_checks
     else:
+        direction, score, checks = "WAIT", max(long_score, short_score), long_checks if long_score >= short_score else short_checks
 
-        sl = np.nan
-        tp1 = np.nan
-        tp2 = np.nan
-        tp3 = np.nan
+    # مستويات تقديرية مبنية على ATR؛ لا تمثل ضماناً لوصول السعر إليها
+    entry = close
+    if direction == "LONG":
+        sl = entry - 1.5 * atr
+        risk = entry - sl
+        targets = [entry + risk, entry + 2*risk, entry + 3*risk]
+    elif direction == "SHORT":
+        sl = entry + 1.5 * atr
+        risk = sl - entry
+        targets = [entry - risk, entry - 2*risk, entry - 3*risk]
+    else:
+        sl = None
+        targets = []
+        risk = None
 
     return {
-        "symbol": symbol,
-        "signal": signal,
-        "score": int(score),
-        "entry": entry,
-        "sl": sl,
-        "tp1": tp1,
-        "tp2": tp2,
-        "tp3": tp3,
-        "rsi": float(x["RSI"]),
-        "atr": atr,
-        "volume_ratio": float(x["VOL_RATIO"]),
-        "trend15": trend15,
-        "trend1": trend1,
-        "trend4": trend4,
-        "chart": d15
+        "direction": direction, "score": score, "long_score": long_score,
+        "short_score": short_score, "entry": entry, "sl": sl,
+        "targets": targets, "atr": atr, "rsi": float(last["rsi"]),
+        "ema20": float(last["ema20"]), "ema50": float(last["ema50"]),
+        "ema200": float(last["ema200"]), "macd": float(last["macd"]),
+        "volume_ratio": float(last["volume"] / last["vol_sma20"]) if last["vol_sma20"] else 0,
+        "checks": checks, "candle_time": last["close_time"]
     }
 
 
 def fmt_price(value):
-
-    if pd.isna(value):
+    if value is None or not np.isfinite(value):
         return "—"
-
-    return f"{value:,.8g}"
-
-
-# ==========================================
-# SIDEBAR SETTINGS
-# ==========================================
-
-st.sidebar.header("⚙️ إعدادات التحليل")
-
-mode = st.sidebar.radio(
-    "وضع التشغيل",
-    [
-        "تحليل عملة",
-        "ماسح العملات"
-    ]
-)
-
-min_score = st.sidebar.slider(
-    "الحد الأدنى لقوة الإشارة",
-    60, 100, 70
-)
-
-sl_atr = st.sidebar.slider(
-    "وقف الخسارة ATR",
-    0.5, 3.0, 1.5, 0.1
-)
-
-rr1 = st.sidebar.number_input(
-    "الهدف الأول R",
-    0.5, 5.0, 1.0
-)
-
-rr2 = st.sidebar.number_input(
-    "الهدف الثاني R",
-    1.0, 8.0, 2.0
-)
-
-rr3 = st.sidebar.number_input(
-    "الهدف الثالث R",
-    1.5, 12.0, 3.0
-)
-
-capital = st.sidebar.number_input(
-    "رأس المال بالدولار",
-    min_value=10.0,
-    value=1000.0,
-    step=100.0
-)
-
-risk_pct = st.sidebar.slider(
-    "المخاطرة %",
-    0.1, 5.0, 1.0, 0.1
-)
-
-leverage = st.sidebar.number_input(
-    "الرافعة للتقدير فقط",
-    1, 125, 5
-)
-
-
-# ==========================================
-# SINGLE COIN ANALYSIS
-# ==========================================
-
-if mode == "تحليل عملة":
-
-    symbol = st.sidebar.text_input(
-        "رمز العقد",
-        "BTCUSDT"
-    ).strip().upper()
-
-    if st.button(
-        "🔍 تحليل الآن",
-        type="primary",
-        use_container_width=True
-    ):
-
-        if not symbol.endswith("USDT"):
-
-            st.error(
-                "أدخل رمزاً مثل BTCUSDT أو ETHUSDT"
-            )
-
-        else:
-
-            try:
-
-                with st.spinner(
-                    "جاري تحميل البيانات وتحليل السوق..."
-                ):
-
-                    result = analyze_symbol(
-                        symbol,
-                        sl_atr,
-                        rr1,
-                        rr2,
-                        rr3
-                    )
-
-                if result is None:
-
-                    st.warning(
-                        "البيانات غير كافية."
-                    )
-
-                else:
-
-                    c1, c2, c3, c4 = st.columns(4)
-
-                    c1.metric(
-                        "الإشارة",
-                        result["signal"]
-                    )
-
-                    c2.metric(
-                        "قوة الإشارة",
-                        f'{result["score"]}/100'
-                    )
-
-                    c3.metric(
-                        "RSI",
-                        f'{result["rsi"]:.1f}'
-                    )
-
-                    c4.metric(
-                        "حجم التداول",
-                        f'{result["volume_ratio"]:.2f}x'
-                    )
-
-                    t1, t2, t3 = st.columns(3)
-
-                    t1.metric(
-                        "اتجاه 4H",
-                        result["trend4"]
-                    )
-
-                    t2.metric(
-                        "اتجاه 1H",
-                        result["trend1"]
-                    )
-
-                    t3.metric(
-                        "اتجاه 15M",
-                        result["trend15"]
-                    )
-
-                    if result["signal"] != "WAIT":
-
-                        st.subheader(
-                            "🎯 مستويات الصفقة"
-                        )
-
-                        p1, p2, p3, p4, p5 = st.columns(5)
-
-                        p1.metric(
-                            "الدخول",
-                            fmt_price(result["entry"])
-                        )
-
-                        p2.metric(
-                            "وقف الخسارة",
-                            fmt_price(result["sl"])
-                        )
-
-                        p3.metric(
-                            "TP1",
-                            fmt_price(result["tp1"])
-                        )
-
-                        p4.metric(
-                            "TP2",
-                            fmt_price(result["tp2"])
-                        )
-
-                        p5.metric(
-                            "TP3",
-                            fmt_price(result["tp3"])
-                        )
-
-                        risk_cash = (
-                            capital * risk_pct / 100
-                        )
-
-                        risk_unit = abs(
-                            result["entry"] - result["sl"]
-                        )
-
-                        qty = (
-                            risk_cash / risk_unit
-                            if risk_unit else 0
-                        )
-
-                        notional = qty * result["entry"]
-
-                        margin = notional / leverage
-
-                        st.info(
-                            f"المخاطرة: ${risk_cash:,.2f} | "
-                            f"الكمية التقديرية: {qty:.6g} | "
-                            f"القيمة الاسمية: ${notional:,.2f} | "
-                            f"الهامش التقريبي: ${margin:,.2f}"
-                        )
-
-                    else:
-
-                        st.warning(
-                            "لا توجد إشارة دخول مكتملة حالياً."
-                        )
-
-                    # CHART
-
-                    chart = result["chart"].tail(150)
-
-                    fig = go.Figure()
-
-                    fig.add_trace(
-                        go.Candlestick(
-                            x=chart.index,
-                            open=chart["Open"],
-                            high=chart["High"],
-                            low=chart["Low"],
-                            close=chart["Close"],
-                            name="15M"
-                        )
-                    )
-
-                    for col in [
-                        "EMA20",
-                        "EMA50",
-                        "EMA200"
-                    ]:
-
-                        fig.add_trace(
-                            go.Scatter(
-                                x=chart.index,
-                                y=chart[col],
-                                mode="lines",
-                                name=col
-                            )
-                        )
-
-                    if result["signal"] != "WAIT":
-
-                        levels = [
-                            (result["sl"], "SL"),
-                            (result["tp1"], "TP1"),
-                            (result["tp2"], "TP2"),
-                            (result["tp3"], "TP3")
-                        ]
-
-                        for price, label in levels:
-
-                            fig.add_hline(
-                                y=price,
-                                line_dash="dash",
-                                annotation_text=label
-                            )
-
-                    fig.update_layout(
-                        template="plotly_dark",
-                        height=590,
-                        xaxis_rangeslider_visible=False
-                    )
-
-                    st.plotly_chart(
-                        fig,
-                        use_container_width=True
-                    )
-
-                    st.caption(
-                        f"آخر شمعة مغلقة: {chart.index[-1]}"
-                    )
-
-            except Exception as exc:
-
-                st.error(str(exc))
-
-
-# ==========================================
-# MARKET SCANNER
-# ==========================================
-
-else:
-
-    st.subheader(
-        "🔎 ماسح عقود Bybit USDT"
+    if abs(value) >= 1000:
+        return f"{value:,.2f}"
+    if abs(value) >= 1:
+        return f"{value:,.5f}".rstrip("0").rstrip(".")
+    return f"{value:.8f}".rstrip("0").rstrip(".")
+
+
+def make_chart(df, result, symbol):
+    view = df.tail(120).copy()
+    fig = go.Figure(data=[go.Candlestick(
+        x=view["open_time"], open=view["open"], high=view["high"],
+        low=view["low"], close=view["close"], name="السعر",
+        increasing_line_color="#16c79a", decreasing_line_color="#ff6577"
+    )])
+    fig.add_trace(go.Scatter(x=view["open_time"], y=view["ema20"], name="EMA 20", line=dict(width=1.2, color="#e8c66a")))
+    fig.add_trace(go.Scatter(x=view["open_time"], y=view["ema50"], name="EMA 50", line=dict(width=1.2, color="#55a8ff")))
+    fig.add_trace(go.Scatter(x=view["open_time"], y=view["ema200"], name="EMA 200", line=dict(width=1.2, color="#b18cff")))
+    if result["direction"] in ("LONG", "SHORT"):
+        levels = [("الدخول", result["entry"], "#e8c66a"), ("وقف الخسارة", result["sl"], "#ff6577")]
+        levels += [(f"TP{i+1}", p, "#16c79a") for i,p in enumerate(result["targets"])]
+        for label, price, color in levels:
+            fig.add_hline(y=price, line_dash="dash", line_color=color,
+                          annotation_text=f"{label}: {fmt_price(price)}",
+                          annotation_position="top right")
+    fig.update_layout(
+        template="plotly_dark", height=520, margin=dict(l=8,r=8,t=35,b=8),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(7,13,22,.8)",
+        xaxis_rangeslider_visible=False, title=f"{symbol} · الشموع والمؤشرات",
+        legend=dict(orientation="h", y=1.08, x=0)
     )
+    return fig
 
-    scan_count = st.sidebar.slider(
-        "عدد العملات للفحص",
-        5, 30, 10
+
+# -------------------- واجهة التطبيق --------------------
+st.markdown("""
+<div class="hero" dir="rtl">
+  <div class="brand">GALEIC FUTURES PRO</div>
+  <div class="sub">محلل عقود Binance Futures · إشارات LONG / SHORT · تحليل فقط دون تنفيذ صفقات</div>
+</div>
+""", unsafe_allow_html=True)
+
+try:
+    symbols = get_symbols()
+except Exception as exc:
+    st.error("تعذر الاتصال ببيانات Binance Futures. تحقق من الإنترنت ثم أعد تحميل الصفحة.")
+    st.caption(f"تفاصيل تقنية: {exc}")
+    st.stop()
+
+st.markdown('<div class="panel" dir="rtl">', unsafe_allow_html=True)
+st.subheader("🔎 ابحث عن العملة واختر الفريم")
+query = st.text_input("ابحث باسم العملة أو الزوج", placeholder="مثال: BTC أو ETH أو SOLUSDT").strip().upper()
+matches = [s for s in symbols if query in s] if query else ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT"]
+matches = [s for s in matches if s in symbols]
+if not matches:
+    st.warning("لا توجد أزواج USDT-M Futures مطابقة. جرّب رمزاً آخر.")
+    st.markdown("</div>", unsafe_allow_html=True)
+    st.stop()
+
+c1, c2 = st.columns([1.25, 1])
+with c1:
+    selected_symbol = st.selectbox("زوج التداول", matches, index=0)
+with c2:
+    selected_interval = st.selectbox(
+        "الفريم الزمني",
+        INTERVALS,
+        index=INTERVALS.index("15m"),
+        format_func=lambda x: f"{x} — {INTERVAL_LABELS[x]}"
     )
+analyze_clicked = st.button("📊 تحليل العملة", use_container_width=True)
+st.markdown('<div class="small-note">تُستخدم آخر شمعة مغلقة فقط. البحث يعرض عقود USDT-M الدائمة المتاحة للتداول.</div>', unsafe_allow_html=True)
+st.markdown("</div>", unsafe_allow_html=True)
 
-    if st.button(
-        "🚀 ابدأ مسح السوق",
-        type="primary",
-        use_container_width=True
-    ):
-
+if analyze_clicked:
+    with st.spinner(f"جارٍ تحليل {selected_symbol} على فريم {selected_interval}..."):
         try:
-
-            with st.spinner(
-                "تحميل قائمة العملات..."
-            ):
-
-                tickers = get_linear_tickers()
-
-                tickers = tickers.sort_values(
-                    "turnover24h",
-                    ascending=False
-                ).head(scan_count)
-
-            results = []
-
-            progress = st.progress(0)
-
-            status = st.empty()
-
-            total = max(len(tickers), 1)
-
-            for i, row in enumerate(
-                tickers.itertuples(index=False),
-                start=1
-            ):
-
-                symbol = row.symbol
-
-                status.caption(
-                    f"فحص {symbol} — {i}/{total}"
-                )
-
-                try:
-
-                    item = analyze_symbol(
-                        symbol,
-                        sl_atr,
-                        rr1,
-                        rr2,
-                        rr3
-                    )
-
-                    if (
-                        item
-                        and item["signal"] != "WAIT"
-                        and item["score"] >= min_score
-                    ):
-
-                        results.append(item)
-
-                except MarketDataError:
-
-                    raise
-
-                except Exception:
-
-                    pass
-
-                progress.progress(i / total)
-
-                time.sleep(0.12)
-
-            progress.empty()
-
-            status.empty()
-
-            if results:
-
-                results.sort(
-                    key=lambda item: item["score"],
-                    reverse=True
-                )
-
-                table = pd.DataFrame([
-
-                    {
-                        "العقد": item["symbol"],
-                        "الإشارة": item["signal"],
-                        "القوة": item["score"],
-                        "السعر": item["entry"],
-                        "RSI": round(item["rsi"], 1),
-                        "الحجم": round(
-                            item["volume_ratio"], 2
-                        ),
-                        "اتجاه 4H": item["trend4"],
-                        "اتجاه 1H": item["trend1"]
-                    }
-
-                    for item in results
-
-                ])
-
-                st.success(
-                    f"تم العثور على {len(results)} إشارة."
-                )
-
-                st.dataframe(
-                    table,
-                    use_container_width=True,
-                    hide_index=True
-                )
-
-                selected = st.selectbox(
-                    "اختر عقداً لعرض مستوياته",
-                    [
-                        item["symbol"]
-                        for item in results
-                    ]
-                )
-
-                chosen = next(
-                    item for item in results
-                    if item["symbol"] == selected
-                )
-
-                a, b, c, d, e = st.columns(5)
-
-                a.metric(
-                    "الدخول",
-                    fmt_price(chosen["entry"])
-                )
-
-                b.metric(
-                    "وقف الخسارة",
-                    fmt_price(chosen["sl"])
-                )
-
-                c.metric(
-                    "TP1",
-                    fmt_price(chosen["tp1"])
-                )
-
-                d.metric(
-                    "TP2",
-                    fmt_price(chosen["tp2"])
-                )
-
-                e.metric(
-                    "TP3",
-                    fmt_price(chosen["tp3"])
-                )
-
-            else:
-
-                st.warning(
-                    "لم تظهر إشارات مطابقة للشروط."
-                )
-
+            raw_df = get_klines(selected_symbol, selected_interval, 300)
+            if len(raw_df) < 210:
+                st.error("البيانات التاريخية غير كافية لهذا الفريم لإجراء تحليل EMA200 موثوق.")
+                st.stop()
+            data = add_indicators(raw_df)
+            result = analyze(data)
+            st.session_state["last_analysis"] = {
+                "symbol": selected_symbol, "interval": selected_interval,
+                "data": data, "result": result
+            }
+        except requests.RequestException as exc:
+            st.error("فشل جلب بيانات السوق من Binance. أعد المحاولة بعد قليل.")
+            st.caption(str(exc))
         except Exception as exc:
+            st.error("حدث خطأ أثناء التحليل.")
+            st.caption(str(exc))
 
-            st.error(str(exc))
+if "last_analysis" in st.session_state:
+    saved = st.session_state["last_analysis"]
+    if saved["symbol"] != selected_symbol or saved["interval"] != selected_interval:
+        st.info("غيّرت العملة أو الفريم. اضغط «تحليل العملة» لتحديث النتائج.")
+    else:
+        result, data = saved["result"], saved["data"]
+        direction = result["direction"]
+        color_class = "buy" if direction == "LONG" else "sell" if direction == "SHORT" else "wait"
+        direction_ar = "شراء (LONG)" if direction == "LONG" else "بيع (SHORT)" if direction == "SHORT" else "انتظار — لا توجد إشارة قوية"
+        st.markdown(f'<div class="panel" dir="rtl"><h3>نتيجة التحليل: <span class="{color_class}">{direction_ar}</span></h3><div class="small-note">آخر شمعة مغلقة: {result["candle_time"].strftime("%Y-%m-%d %H:%M UTC")}</div></div>', unsafe_allow_html=True)
 
+        m1, m2, m3 = st.columns(3)
+        with m1:
+            st.markdown(f'<div class="metric"><div class="metric-label">السعر / الدخول المرجعي</div><div class="metric-value">{fmt_price(result["entry"])}</div></div>', unsafe_allow_html=True)
+        with m2:
+            st.markdown(f'<div class="metric"><div class="metric-label">قوة توافق المؤشرات</div><div class="metric-value gold">{result["score"]}/100</div></div>', unsafe_allow_html=True)
+        with m3:
+            st.markdown(f'<div class="metric"><div class="metric-label">RSI</div><div class="metric-value">{result["rsi"]:.1f}</div></div>', unsafe_allow_html=True)
 
-# ==========================================
-# FOOTER
-# ==========================================
+        if direction in ("LONG", "SHORT"):
+            a,b,c,d,e = st.columns(5)
+            values = [("الدخول",result["entry"]),("وقف الخسارة",result["sl"]),("TP1",result["targets"][0]),("TP2",result["targets"][1]),("TP3",result["targets"][2])]
+            for col,(label,val) in zip([a,b,c,d,e],values):
+                with col:
+                    st.markdown(f'<div class="metric"><div class="metric-label">{label}</div><div class="metric-value">{fmt_price(val)}</div></div>', unsafe_allow_html=True)
+            st.success("الإشارة اجتازت حد التوافق المحدد في هذه النسخة. هذا لا يعني ضمان تنفيذ الصفقة أو تحقق الأهداف.")
+        else:
+            st.warning("لا توجد حالياً إشارة تستوفي شروط التوافق. الأفضل الانتظار بدلاً من فرض صفقة.")
+            st.caption(f"درجة LONG: {result['long_score']}/100 · درجة SHORT: {result['short_score']}/100")
 
-st.divider()
+        st.plotly_chart(make_chart(data, result, selected_symbol), use_container_width=True, config={"displayModeBar": False})
 
-st.caption(
-    "GALEIC FUTURES PRO | "
-    "Data Provider: Bybit V5 API | "
-    "تحليل فني فقط، لا يوجد تنفيذ تلقائي للصفقات."
-    )
+        left, right = st.columns(2)
+        with left:
+            st.markdown('<div class="panel" dir="rtl">', unsafe_allow_html=True)
+            st.subheader("🧭 قراءة المؤشرات")
+            st.write(f"EMA 20: **{fmt_price(result['ema20'])}**")
+            st.write(f"EMA 50: **{fmt_price(result['ema50'])}**")
+            st.write(f"EMA 200: **{fmt_price(result['ema200'])}**")
+            st.write(f"MACD: **{result['macd']:.6f}**")
+            st.write(f"حجم التداول / متوسطه: **{result['volume_ratio']:.2f}x**")
+            st.markdown("</div>", unsafe_allow_html=True)
+        with right:
+            st.markdown('<div class="panel" dir="rtl">', unsafe_allow_html=True)
+            st.subheader("✅ شروط الاتجاه")
+            for passed, description in result["checks"]:
+                st.write(("🟢 " if passed else "⚪ ") + description)
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        st.markdown("""
+        <div class="panel small-note" dir="rtl">
+        <b>تنبيه مخاطر:</b> هذه أداة تحليل فني تعليمية وليست نصيحة استثمارية. درجة التوافق ليست احتمال نجاح.
+        مستويات الأهداف ووقف الخسارة تقديرية ومبنية على ATR، وقد لا تُنفذ عند السعر المحدد بسبب الانزلاق السعري
+        أو الرسوم أو ظروف السوق. اختبر الاستراتيجية تاريخياً وعلى حساب تجريبي قبل المخاطرة بأموال حقيقية.
+        </div>
+        """, unsafe_allow_html=True)
+
+st.markdown('<div class="small-note" style="text-align:center;padding:18px" dir="rtl">GALEIC FUTURES PRO · بيانات عامة من Binance Futures · لا يتم تنفيذ أي أوامر تداول</div>', unsafe_allow_html=True)
