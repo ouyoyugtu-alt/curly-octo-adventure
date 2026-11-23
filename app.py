@@ -3,192 +3,290 @@ import pandas as pd
 import numpy as np
 import requests
 import plotly.graph_objects as go
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 st.set_page_config(page_title="GALEIC FUTURES PRO", page_icon="📈", layout="wide")
-OKX="https://www.okx.com"
 BYBIT="https://api.bybit.com"
-FRAMES={"1m":("1m","1 دقيقة",1),"3m":("3m","3 دقائق",3),"5m":("5m","5 دقائق",5),
-"15m":("15m","15 دقيقة",15),"30m":("30m","30 دقيقة",30),"1h":("1H","1 ساعة",60),
-"2h":("2H","ساعتان",120),"4h":("4H","4 ساعات",240),"6h":("6H","6 ساعات",360),
-"12h":("12H","12 ساعة",720),"1d":("1D","يومي",1440),"1w":("1W","أسبوعي",10080)}
+FRAMES={"1m":("1",1),"3m":("3",3),"5m":("5",5),"15m":("15",15),"30m":("30",30),
+"1h":("60",60),"2h":("120",120),"4h":("240",240),"6h":("360",360),"12h":("720",720),
+"1D":("D",1440),"1W":("W",10080)}
+POPULAR=["BTC","ETH","SOL","XRP","BNB","DOGE","ADA","AVAX","LINK","SUI"]
 
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;800&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Cairo:wght@400;500;600;700;800&display=swap');
 html,body,[class*="css"]{font-family:'Cairo',sans-serif}
-.stApp{background:radial-gradient(circle at top right,#14243b 0%,#080d16 43%,#05080e 100%);color:#f4f7fb}
-.block-container{max-width:1150px;padding-top:1rem;padding-bottom:2rem}
-.hero{background:linear-gradient(120deg,#12233a,#080e18);border:1px solid #29435f;border-radius:22px;padding:20px;margin-bottom:16px}
-.brand{font-size:clamp(25px,5vw,38px);font-weight:800;color:#e8c66a}
-.sub,.note{color:#aebdd0;font-size:13px}
-.panel{background:rgba(14,23,36,.96);border:1px solid #20354d;border-radius:17px;padding:15px;margin:12px 0}
-.metric{background:linear-gradient(145deg,#13243a,#0c1522);border:1px solid #29425e;border-radius:14px;padding:12px 6px;text-align:center;min-height:78px}
-.metric-label{font-size:12px;color:#9fb1c6}.metric-value{font-size:clamp(15px,3vw,21px);font-weight:800;color:#fff;direction:ltr;overflow-wrap:anywhere}
-.buy{color:#20d69a!important}.sell{color:#ff6577!important}.wait{color:#e8c66a!important}.gold{color:#e8c66a!important}
-div.stButton>button{width:100%;min-height:49px;border-radius:12px;background:linear-gradient(90deg,#c99d3d,#f0d27b);color:#111827;border:1px solid #d2ad50;font-weight:800}
-[data-testid="stTextInput"] input,[data-testid="stSelectbox"] div[data-baseweb="select"]{background:#101b2a;color:white}
-@media(max-width:640px){.block-container{padding-left:.7rem;padding-right:.7rem}.hero{padding:15px}.panel{padding:11px}}
+.stApp{background:#080d16;color:#eef3fa}.block-container{max-width:1250px;padding-top:1rem;padding-bottom:2rem}
+.hero{background:linear-gradient(115deg,#172b45,#0b1320);border:1px solid #2c4562;border-radius:20px;padding:18px;margin-bottom:14px}
+.brand{font-size:clamp(25px,5vw,36px);font-weight:800;color:#e8c66a}.muted{color:#a9b8ca;font-size:13px}
+.panel{background:#101a29;border:1px solid #22364e;border-radius:16px;padding:14px;margin:10px 0}
+.tile{background:linear-gradient(145deg,#17283e,#101a29);border:1px solid #2b4058;border-radius:13px;padding:12px 8px;text-align:center;min-height:76px}
+.tile small{color:#9fb0c4;font-size:12px}.tile strong{display:block;color:#f5f7fb;font-size:clamp(15px,2.6vw,21px);overflow-wrap:anywhere}
+.up{color:#20d69a!important}.down{color:#ff687a!important}.gold{color:#e8c66a!important}
+div.stButton>button{border-radius:11px;min-height:43px;font-weight:700}
+div.stButton>button[kind="primary"]{background:linear-gradient(90deg,#c99d3d,#f0d27b);color:#111827;border:0}
+@media(max-width:640px){.block-container{padding-left:.65rem;padding-right:.65rem}.panel{padding:10px}.hero{padding:14px}}
 </style>""",unsafe_allow_html=True)
 
-class DataError(Exception): pass
+class MarketError(Exception): pass
 
-def get_json(base,path,params):
-    try:
-        r=requests.get(base+path,params=params,timeout=(8,20),headers={"User-Agent":"Mozilla/5.0 GALEIC-PRO"})
-    except requests.RequestException as e:
-        raise DataError("تعذر الاتصال بمصدر البيانات. افحص الإنترنت أو جرّب المنصة الأخرى.") from e
-    if r.status_code in (403,451,429):
-        msg={403:"رفض مزود البيانات الاتصال (403).",451:"الوصول إلى مزود البيانات مقيّد (451).",429:"تجاوزت حد الطلبات مؤقتاً (429)."}
-        raise DataError(msg[r.status_code]+" جرّب المصدر الآخر.")
-    if r.status_code!=200: raise DataError(f"فشل الاتصال: HTTP {r.status_code}.")
+def get_json(url,params=None):
+    try:r=requests.get(url,params=params,timeout=(7,15),headers={"User-Agent":"Mozilla/5.0 GALEIC"})
+    except requests.RequestException as e:raise MarketError("تعذر الاتصال بمصدر البيانات. تحقق من الإنترنت.") from e
+    if r.status_code in (403,429,451):raise MarketError(f"رفض مزود البيانات الطلب HTTP {r.status_code}. جرّب لاحقاً أو مصدراً آخر.")
+    if r.status_code!=200:raise MarketError(f"فشل الاتصال HTTP {r.status_code}.")
     try:return r.json()
-    except ValueError as e: raise DataError("استجابة مزود البيانات غير مفهومة.") from e
+    except ValueError as e:raise MarketError("استجابة مزود البيانات غير مفهومة.") from e
 
-def normalize(raw):
-    s=raw.strip().upper().replace("/","").replace("-","").replace(" ","")
+def base_symbol(raw):
+    s=str(raw).strip().upper().replace("/","").replace("-","").replace(" ","")
     if s.endswith(".P"):s=s[:-2]
-    base=s[:-4] if s.endswith("USDT") else s
-    if not base or not base.isalnum() or len(base)>20: raise DataError("اكتب رمزاً صحيحاً مثل BTC أو ACEUSDT.")
-    return base,base+"USDT"
+    if s.endswith("USDT"):s=s[:-4]
+    if not s or not s.isalnum() or len(s)>20:raise MarketError("أدخل رمزاً صحيحاً مثل BTC أو ETH أو SOLUSDT.")
+    return s
 
-@st.cache_data(ttl=900,show_spinner=False)
-def okx_contracts():
-    j=get_json(OKX,"/api/v5/public/instruments",{"instType":"SWAP"})
-    if j.get("code")!="0":raise DataError("OKX: "+str(j.get("msg","تعذر تحميل قائمة العقود.")))
-    out={}
-    for x in j.get("data",[]):
-        if x.get("state")=="live" and x.get("ctType")=="linear" and x.get("quoteCcy")=="USDT" and x.get("settleCcy")=="USDT":
-            out[x.get("baseCcy","").upper()]=x["instId"]
+@st.cache_data(ttl=600,show_spinner=False)
+def search_exchanges(base):
+    pair=base+"USDT";out=[]
+    # Binance
+    try:
+        j=get_json("https://fapi.binance.com/fapi/v1/exchangeInfo")
+        ok=any(x.get("symbol")==pair and x.get("contractType")=="PERPETUAL" and x.get("status")=="TRADING" for x in j.get("symbols",[]))
+        out.append({"المنصة":"Binance Futures","الحالة":"متاح" if ok else "غير مدرج"})
+    except Exception:out.append({"المنصة":"Binance Futures","الحالة":"تعذر الاتصال"})
+    # Bybit
+    try:
+        j=get_json(BYBIT+"/v5/market/instruments-info",{"category":"linear","symbol":pair})
+        ok=any(x.get("symbol")==pair and x.get("status")=="Trading" for x in j.get("result",{}).get("list",[]))
+        out.append({"المنصة":"Bybit Futures","الحالة":"متاح" if ok else "غير مدرج"})
+    except Exception:out.append({"المنصة":"Bybit Futures","الحالة":"تعذر الاتصال"})
+    # OKX
+    try:
+        j=get_json("https://www.okx.com/api/v5/public/instruments",{"instType":"SWAP"})
+        ok=any(x.get("baseCcy")==base and x.get("quoteCcy")=="USDT" and x.get("settleCcy")=="USDT" and x.get("state")=="live" and x.get("ctType")=="linear" for x in j.get("data",[]))
+        out.append({"المنصة":"OKX Futures","الحالة":"متاح" if ok else "غير مدرج"})
+    except Exception:out.append({"المنصة":"OKX Futures","الحالة":"تعذر الاتصال"})
+    # Gate
+    try:
+        j=get_json("https://api.gateio.ws/api/v4/futures/usdt/contracts")
+        ok=any(x.get("name")==base+"_USDT" and not x.get("in_delisting",False) for x in j if isinstance(x,dict))
+        out.append({"المنصة":"Gate.io Futures","الحالة":"متاح" if ok else "غير مدرج"})
+    except Exception:out.append({"المنصة":"Gate.io Futures","الحالة":"تعذر الاتصال"})
     return out
 
-def fetch_okx(base,frame):
-    contracts=okx_contracts()
-    inst=contracts.get(base)
-    if not inst:
-        raise DataError(f"العملة {base} غير مدرجة حالياً كعقد دائم USDT على OKX. جرّب Bybit Futures أو تحقق من رمز العملة.")
-    j=get_json(OKX,"/api/v5/market/candles",{"instId":inst,"bar":FRAMES[frame][0],"limit":"300"})
-    if j.get("code")!="0":raise DataError(f"OKX ({inst}): {j.get('msg','تعذر جلب الشموع')}")
-    rows=j.get("data",[])
-    if not rows:raise DataError(f"لا توجد شموع للعقد {inst}.")
-    d=pd.DataFrame(rows,columns=["ts","open","high","low","close","volume","v2","v3","confirm"])
-    d["open_time"]=pd.to_datetime(pd.to_numeric(d.ts),unit="ms",utc=True)
-    for c in ["open","high","low","close","volume"]:d[c]=pd.to_numeric(d[c],errors="coerce")
-    d=d[d.confirm.astype(str)=="1"].sort_values("open_time")
-    return d[["open_time","open","high","low","close","volume"]].dropna().reset_index(drop=True),inst
-
-def fetch_bybit(symbol,frame):
-    interval={"1m":"1","3m":"3","5m":"5","15m":"15","30m":"30","1h":"60","2h":"120","4h":"240","6h":"360","12h":"720","1d":"D","1w":"W"}[frame]
-    j=get_json(BYBIT,"/v5/market/kline",{"category":"linear","symbol":symbol,"interval":interval,"limit":"500"})
-    if j.get("retCode")!=0:raise DataError("Bybit: "+str(j.get("retMsg","لم يتم العثور على العقد.")))
+@st.cache_data(ttl=45,show_spinner=False)
+def candles(symbol,frame):
+    j=get_json(BYBIT+"/v5/market/kline",{"category":"linear","symbol":symbol+"USDT","interval":FRAMES[frame][0],"limit":500})
+    if j.get("retCode")!=0:raise MarketError("Bybit: "+str(j.get("retMsg","تعذر جلب الشموع.")))
     rows=j.get("result",{}).get("list",[])
-    if not rows:raise DataError(f"لا يوجد عقد {symbol} في Bybit Futures.")
+    if not rows:raise MarketError(f"لا توجد شموع للعقد {symbol}USDT على Bybit.")
     d=pd.DataFrame(rows,columns=["ts","open","high","low","close","volume","turnover"])
-    d["open_time"]=pd.to_datetime(pd.to_numeric(d.ts),unit="ms",utc=True)
+    d["time"]=pd.to_datetime(pd.to_numeric(d.ts),unit="ms",utc=True)
     for c in ["open","high","low","close","volume"]:d[c]=pd.to_numeric(d[c],errors="coerce")
-    d=d.sort_values("open_time").reset_index(drop=True)
-    duration=pd.Timedelta(minutes=FRAMES[frame][2])
-    if len(d) and d.iloc[-1].open_time+duration>pd.Timestamp.now(tz="UTC"):d=d.iloc[:-1]
-    return d[["open_time","open","high","low","close","volume"]].dropna().reset_index(drop=True),symbol
+    d=d.sort_values("time").reset_index(drop=True)
+    dur=pd.Timedelta(minutes=FRAMES[frame][1])
+    if len(d) and d.iloc[-1].time+dur>pd.Timestamp.now(tz="UTC"):d=d.iloc[:-1]
+    return d[["time","open","high","low","close","volume"]].dropna().reset_index(drop=True)
+
+@st.cache_data(ttl=30,show_spinner=False)
+def ticker(symbol):
+    j=get_json(BYBIT+"/v5/market/tickers",{"category":"linear","symbol":symbol+"USDT"})
+    a=j.get("result",{}).get("list",[])
+    if j.get("retCode")!=0 or not a:raise MarketError("بيانات العقود غير متاحة لهذه العملة.")
+    return a[0]
+
+@st.cache_data(ttl=60,show_spinner=False)
+def oi_data(symbol):
+    j=get_json(BYBIT+"/v5/market/open-interest",{"category":"linear","symbol":symbol+"USDT","intervalTime":"15min","limit":1})
+    a=j.get("result",{}).get("list",[])
+    return float(a[0]["openInterest"]) if j.get("retCode")==0 and a else None
+
+@st.cache_data(ttl=60,show_spinner=False)
+def ls_data(symbol):
+    j=get_json(BYBIT+"/v5/market/account-ratio",{"category":"linear","symbol":symbol+"USDT","period":"15min","limit":1})
+    a=j.get("result",{}).get("list",[])
+    return a[0] if j.get("retCode")==0 and a else None
 
 def indicators(d):
-    d=d.copy();c,h,l=d.close,d.high,d.low
-    d["ema20"]=c.ewm(span=20,adjust=False).mean();d["ema50"]=c.ewm(span=50,adjust=False).mean();d["ema200"]=c.ewm(span=200,adjust=False).mean()
+    x=d.copy();c,h,l=x.close,x.high,x.low
+    for n in [20,50,200]:x[f"ema{n}"]=c.ewm(span=n,adjust=False).mean()
     delta=c.diff();gain=delta.clip(lower=0).ewm(alpha=1/14,adjust=False).mean();loss=(-delta.clip(upper=0)).ewm(alpha=1/14,adjust=False).mean()
-    d["rsi"]=(100-100/(1+gain/loss.replace(0,np.nan))).fillna(50)
+    x["rsi"]=(100-100/(1+gain/loss.replace(0,np.nan))).fillna(50)
     e12=c.ewm(span=12,adjust=False).mean();e26=c.ewm(span=26,adjust=False).mean()
-    d["macd"]=e12-e26;d["macds"]=d.macd.ewm(span=9,adjust=False).mean()
-    prev=c.shift(1);tr=pd.concat([h-l,(h-prev).abs(),(l-prev).abs()],axis=1).max(axis=1)
-    d["atr"]=tr.ewm(alpha=1/14,adjust=False).mean();d["volavg"]=d.volume.rolling(20).mean()
-    return d.replace([np.inf,-np.inf],np.nan).dropna().reset_index(drop=True)
+    x["macd"]=e12-e26;x["macds"]=x.macd.ewm(span=9,adjust=False).mean()
+    tr=pd.concat([h-l,(h-c.shift()).abs(),(l-c.shift()).abs()],axis=1).max(axis=1)
+    x["atr"]=tr.ewm(alpha=1/14,adjust=False).mean()
+    x["bbmid"]=c.rolling(20).mean();sd=c.rolling(20).std()
+    x["bbup"]=x.bbmid+2*sd;x["bblow"]=x.bbmid-2*sd
+    x["volavg"]=x.volume.rolling(20).mean()
+    return x.replace([np.inf,-np.inf],np.nan).dropna().reset_index(drop=True)
 
-def analyze(d):
-    if len(d)<205:raise DataError("عدد الشموع المغلقة غير كافٍ لحساب EMA200. جرّب فريماً أكبر.")
+def signal_for(d):
+    if len(d)<205:raise MarketError("الشموع غير كافية لحساب EMA200. اختر فريماً أكبر.")
     x,p=d.iloc[-1],d.iloc[-2]
-    lr=[(x.ema20>x.ema50,"EMA20 أعلى EMA50"),(x.ema50>x.ema200,"EMA50 أعلى EMA200"),(x.close>x.ema20,"السعر أعلى EMA20"),(x.macd>x.macds,"MACD إيجابي"),(50<=x.rsi<72,"RSI يدعم الصعود"),(x.volume>x.volavg,"الحجم أعلى متوسط 20 شمعة"),(x.close>p.close,"الإغلاق أعلى من السابق")]
-    sr=[(x.ema20<x.ema50,"EMA20 أسفل EMA50"),(x.ema50<x.ema200,"EMA50 أسفل EMA200"),(x.close<x.ema20,"السعر أسفل EMA20"),(x.macd<x.macds,"MACD سلبي"),(28<x.rsi<=50,"RSI يدعم الهبوط"),(x.volume>x.volavg,"الحجم أعلى متوسط 20 شمعة"),(x.close<p.close,"الإغلاق أسفل السابق")]
-    ls=round(sum(bool(a) for a,b in lr)/7*100);ss=round(sum(bool(a) for a,b in sr)/7*100)
-    if ls>=72 and ls>ss:side,score,rules="LONG",ls,lr
-    elif ss>=72 and ss>ls:side,score,rules="SHORT",ss,sr
-    else:side,score,rules="WAIT",max(ls,ss),lr if ls>=ss else sr
-    entry,atr=float(x.close),float(x.atr)
-    if side=="LONG":stop=entry-1.5*atr;risk=entry-stop;targets=[entry+risk,entry+2*risk,entry+3*risk]
-    elif side=="SHORT":stop=entry+1.5*atr;risk=stop-entry;targets=[entry-risk,entry-2*risk,entry-3*risk]
+    up=[x.ema20>x.ema50,x.ema50>x.ema200,x.close>x.ema20,x.macd>x.macds,50<=x.rsi<70,x.close>p.close]
+    dn=[x.ema20<x.ema50,x.ema50<x.ema200,x.close<x.ema20,x.macd<x.macds,30<x.rsi<=50,x.close<p.close]
+    a=round(100*sum(up)/6);b=round(100*sum(dn)/6)
+    if a>=67 and a>b:side,score="LONG",a
+    elif b>=67 and b>a:side,score="SHORT",b
+    else:side,score="WAIT",max(a,b)
+    entry=float(x.close);atr=float(x.atr)
+    if side=="LONG":stop=entry-1.5*atr;targets=[entry+(entry-stop)*k for k in (1,2,3)]
+    elif side=="SHORT":stop=entry+1.5*atr;targets=[entry-(stop-entry)*k for k in (1,2,3)]
     else:stop=None;targets=[]
-    return {"side":side,"score":score,"ls":ls,"ss":ss,"entry":entry,"stop":stop,"targets":targets,"rsi":float(x.rsi),"ema20":float(x.ema20),"ema50":float(x.ema50),"ema200":float(x.ema200),"macd":float(x.macd),"volratio":float(x.volume/x.volavg) if x.volavg else 0,"rules":rules,"candle":x.open_time}
+    return {"side":side,"score":score,"long":a,"short":b,"entry":entry,"stop":stop,"targets":targets,
+            "rsi":float(x.rsi),"ema20":float(x.ema20),"ema50":float(x.ema50),"ema200":float(x.ema200),
+            "macd":float(x.macd),"atr":atr,"time":x.time}
 
 def fmt(v):
-    if v is None or not np.isfinite(v):return "—"
-    if abs(v)>=1000:return f"{v:,.2f}"
-    if abs(v)>=1:return f"{v:,.6f}".rstrip("0").rstrip(".")
-    return f"{v:.10f}".rstrip("0").rstrip(".")
+    if v is None:return "—"
+    try:
+        v=float(v)
+        if not np.isfinite(v):return "—"
+        return f"{v:,.2f}" if abs(v)>=1000 else (f"{v:,.6f}".rstrip("0").rstrip(".") if abs(v)>=1 else f"{v:.10f}".rstrip("0").rstrip("."))
+    except Exception:return "—"
 
-def chart(d,r,title):
-    v=d.tail(140);f=go.Figure()
-    f.add_trace(go.Candlestick(x=v.open_time,open=v.open,high=v.high,low=v.low,close=v.close,name="السعر",increasing_line_color="#19c99a",decreasing_line_color="#ff6577"))
-    for c,n,k in [("ema20","EMA20","#e8c66a"),("ema50","EMA50","#55a8ff"),("ema200","EMA200","#b18cff")]:f.add_trace(go.Scatter(x=v.open_time,y=v[c],name=n,line=dict(width=1.2,color=k)))
-    if r["side"]!="WAIT":
-        levels=[("الدخول",r["entry"],"#e8c66a"),("وقف الخسارة",r["stop"],"#ff6577")]+[(f"TP{i+1}",p,"#19c99a") for i,p in enumerate(r["targets"])]
-        for n,y,k in levels:f.add_hline(y=y,line_dash="dash",line_color=k,annotation_text=f"{n}: {fmt(y)}")
-    f.update_layout(template="plotly_dark",height=440,margin=dict(l=5,r=5,t=40,b=5),paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="rgba(7,13,22,.8)",xaxis_rangeslider_visible=False,title=title)
+def tile(label,value,cls=""):
+    st.markdown(f'<div class="tile"><small>{label}</small><strong class="{cls}">{value}</strong></div>',unsafe_allow_html=True)
+
+def chart(d,symbol):
+    v=d.tail(220);f=go.Figure()
+    f.add_trace(go.Candlestick(x=v.time,open=v.open,high=v.high,low=v.low,close=v.close,name="السعر",increasing_line_color="#20c997",decreasing_line_color="#ff687a"))
+    for col,name,color in [("ema20","EMA20","#e8c66a"),("ema50","EMA50","#55a8ff"),("ema200","EMA200","#b18cff"),("bbup","BB Upper","#778899"),("bblow","BB Lower","#778899")]:
+        f.add_trace(go.Scatter(x=v.time,y=v[col],name=name,line=dict(width=1,color=color,dash="dot" if "BB" in name else "solid")))
+    f.update_layout(template="plotly_dark",height=450,margin=dict(l=5,r=5,t=35,b=5),paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="#0b1421",xaxis_rangeslider_visible=False,title=f"{symbol}USDT · شموع يابانية",legend=dict(orientation="h",y=1.08))
     return f
 
-# Controls are displayed before any API request, so API errors never hide the search form.
-st.markdown('<div class="hero" dir="rtl"><div class="brand">GALEIC FUTURES PRO</div><div class="sub">محلل عقود آجلة · LONG / SHORT · تحليل فقط دون تنفيذ صفقات</div></div>',unsafe_allow_html=True)
-st.markdown('<div class="panel" dir="rtl">',unsafe_allow_html=True)
-st.subheader("1. مصدر بيانات العقود")
-provider=st.selectbox("اختر المنصة",["OKX Futures","Bybit Futures"])
-st.caption("عقود USDT الدائمة فقط · لا تحتاج مفاتيح API")
-st.markdown("</div>",unsafe_allow_html=True)
-st.markdown('<div class="panel" dir="rtl">',unsafe_allow_html=True)
-st.subheader("2. ابحث عن العملة")
-typed=st.text_input("رمز العملة أو الزوج",value="BTC",placeholder="BTC أو ETH أو ACEUSDT")
-frame=st.selectbox("3. اختر الفريم الزمني",list(FRAMES),index=3,format_func=lambda k:f"{k} — {FRAMES[k][1]}")
-st.caption("اكتب الرمز الأساسي أو الزوج مع USDT.")
-clicked=st.button("📊 تحليل العملة",use_container_width=True)
-st.markdown("</div>",unsafe_allow_html=True)
-
-if clicked:
+def scan_one(s):
     try:
-        base,symbol=normalize(typed)
-        with st.spinner(f"جارٍ البحث عن {base} وجلب الشموع..."):
-            if provider=="OKX Futures":raw,exchange_symbol=fetch_okx(base,frame)
-            else:raw,exchange_symbol=fetch_bybit(symbol,frame)
-            data=indicators(raw);result=analyze(data)
-            st.session_state["galeic_v4"]={"provider":provider,"base":base,"exchange_symbol":exchange_symbol,"frame":frame,"data":data,"result":result}
-    except DataError as e:
-        st.error(str(e));st.info("إذا لم تكن العملة مدرجة على هذه المنصة، بدّل إلى المنصة الأخرى ثم اضغط تحليل العملة.")
-    except Exception as e:
-        st.error("حدث خطأ غير متوقع أثناء التحليل.");st.caption(str(e))
+        d=indicators(candles(s,"15m"));r=signal_for(d)
+        return {"العملة":s,"الإشارة":r["side"],"قوة التوافق":r["score"],"RSI":round(r["rsi"],1)}
+    except Exception:return {"العملة":s,"الإشارة":"غير متاح","قوة التوافق":0,"RSI":"—"}
 
-saved=st.session_state.get("galeic_v4")
-if saved:
-    try:current_base,_=normalize(typed)
-    except DataError:current_base=""
-    if (saved["provider"],saved["base"],saved["frame"])!=(provider,current_base,frame):
-        st.info("غيّرت العملة أو المنصة أو الفريم. اضغط تحليل العملة لتحديث النتائج.")
-    else:
-        r,d=saved["result"],saved["data"];side=r["side"]
-        label="شراء LONG" if side=="LONG" else "بيع SHORT" if side=="SHORT" else "انتظار — لا توجد إشارة قوية"
-        css="buy" if side=="LONG" else "sell" if side=="SHORT" else "wait"
-        st.markdown(f'<div class="panel" dir="rtl"><h3>نتيجة التحليل: <span class="{css}">{label}</span></h3><div class="note">المنصة: {provider} · العقد: {saved["exchange_symbol"]} · آخر شمعة مغلقة: {r["candle"].strftime("%Y-%m-%d %H:%M UTC")}</div></div>',unsafe_allow_html=True)
-        cards=[("السعر المرجعي",fmt(r["entry"]),""),("توافق المؤشرات",f'{r["score"]}/100',"gold"),("RSI",f'{r["rsi"]:.1f}',"")]
-        cols=st.columns(3)
-        for col,(n,v,k) in zip(cols,cards):
-            with col:st.markdown(f'<div class="metric"><div class="metric-label">{n}</div><div class="metric-value {k}">{v}</div></div>',unsafe_allow_html=True)
-        if side!="WAIT":
-            cols=st.columns(5);levels=[("الدخول",r["entry"]),("وقف الخسارة",r["stop"]),("TP1",r["targets"][0]),("TP2",r["targets"][1]),("TP3",r["targets"][2])]
-            for col,(n,v) in zip(cols,levels):
-                with col:st.markdown(f'<div class="metric"><div class="metric-label">{n}</div><div class="metric-value">{fmt(v)}</div></div>',unsafe_allow_html=True)
-        else:st.warning(f'لا توجد إشارة قوية. LONG: {r["ls"]}/100 · SHORT: {r["ss"]}/100')
-        st.plotly_chart(chart(d,r,f'{saved["exchange_symbol"]} · {frame}'),use_container_width=True,config={"displayModeBar":False})
-        a,b=st.columns(2)
-        with a:
-            st.markdown('<div class="panel" dir="rtl">',unsafe_allow_html=True);st.subheader("المؤشرات")
-            st.write(f'EMA20: **{fmt(r["ema20"])}**');st.write(f'EMA50: **{fmt(r["ema50"])}**');st.write(f'EMA200: **{fmt(r["ema200"])}**');st.write(f'MACD: **{r["macd"]:.8f}**');st.write(f'الحجم/المتوسط: **{r["volratio"]:.2f}x**');st.markdown("</div>",unsafe_allow_html=True)
-        with b:
-            st.markdown('<div class="panel" dir="rtl">',unsafe_allow_html=True);st.subheader("أسباب التقييم")
-            for ok,desc in r["rules"]:st.write(("🟢 " if ok else "⚪ ")+desc)
-            st.markdown("</div>",unsafe_allow_html=True)
-        st.markdown('<div class="panel note" dir="rtl"><b>تنبيه:</b> درجة التوافق ليست احتمال نجاح. الأهداف ووقف الخسارة تقديرية باستخدام ATR ولا تضمن الوصول إليها. الأداة لا تنفذ صفقات.</div>',unsafe_allow_html=True)
+st.markdown('<div class="hero" dir="rtl"><div class="brand">GALEIC FUTURES PRO</div><div class="muted">منصة تحليل العملات والعقود الآجلة · بيانات عامة مجانية · تحليل فقط</div></div>',unsafe_allow_html=True)
 
-st.markdown('<div class="note" style="text-align:center;padding:15px" dir="rtl">GALEIC FUTURES PRO · تحليل فقط · لا يحتاج مفاتيح API</div>',unsafe_allow_html=True)
+# Search bar
+st.markdown('<div class="panel" dir="rtl">',unsafe_allow_html=True)
+st.subheader("🔎 البحث الشامل عن العملات")
+c1,c2=st.columns([3,1])
+with c1:q=st.text_input("رمز العملة",value=st.session_state.get("active_symbol","BTC"),placeholder="BTC / ETH / SOL")
+with c2:
+    st.write("");st.write("")
+    search=st.button("بحث في المنصات",type="primary",use_container_width=True)
+if search:
+    try:
+        s=base_symbol(q)
+        with st.spinner("يتم البحث في المنصات..."):st.session_state["exchange_results"]=search_exchanges(s)
+        st.session_state["active_symbol"]=s
+    except MarketError as e:st.error(str(e))
+symbol=st.session_state.get("active_symbol","BTC")
+if st.session_state.get("exchange_results"):
+    st.caption(f"حالة إدراج {symbol}USDT")
+    st.dataframe(pd.DataFrame(st.session_state["exchange_results"]),use_container_width=True,hide_index=True)
+st.markdown("</div>",unsafe_allow_html=True)
+
+# Chart and timeframe selector
+st.markdown('<div class="panel" dir="rtl">',unsafe_allow_html=True)
+st.subheader(f"📊 الرسم البياني — {symbol}USDT")
+frame=st.radio("الفريم الزمني",list(FRAMES),index=3,horizontal=True)
+st.caption("الرسم والمؤشرات من Bybit Futures عبر واجهة بيانات عامة.")
+st.markdown("</div>",unsafe_allow_html=True)
+try:
+    with st.spinner("تحميل الرسم والشموع..."):
+        raw=candles(symbol,frame);data=indicators(raw);sig=signal_for(data)
+    st.plotly_chart(chart(data,symbol),use_container_width=True,config={"displaylogo":False,"scrollZoom":True,"responsive":True})
+except Exception as e:
+    data,sig=None,None
+    st.warning(str(e))
+
+# Market indicators
+st.markdown('<div class="panel" dir="rtl">',unsafe_allow_html=True)
+st.subheader("📈 لوحة مؤشرات السوق")
+if data is not None:
+    x=data.iloc[-1]
+    vals=[("السعر",fmt(x.close),""),("RSI",f"{x.rsi:.1f}",""),("MACD","صاعد" if x.macd>x.macds else "هابط","up" if x.macd>x.macds else "down"),("ATR",fmt(x.atr),"")]
+    cols=st.columns(4)
+    for col,(a,b,c) in zip(cols,vals):
+        with col:tile(a,b,c)
+    cols=st.columns(3)
+    for col,(a,b) in zip(cols,[("EMA20",fmt(x.ema20)),("EMA50",fmt(x.ema50)),("EMA200",fmt(x.ema200))]):
+        with col:tile(a,b)
+else:st.info("ستظهر المؤشرات بعد تحميل بيانات العملة.")
+st.markdown("</div>",unsafe_allow_html=True)
+
+# Futures metrics
+st.markdown('<div class="panel" dir="rtl">',unsafe_allow_html=True)
+st.subheader("⚡ لوحة العقود الآجلة — Bybit")
+try:
+    t=ticker(symbol);oi=oi_data(symbol);ratio=ls_data(symbol)
+    change=float(t.get("price24hPcnt",0))*100;fund=float(t.get("fundingRate",0))*100
+    cols=st.columns(4)
+    vals=[("تغير 24 ساعة",f"{change:+.2f}%","up" if change>=0 else "down"),("Funding Rate",f"{fund:+.4f}%",""),("Open Interest",fmt(oi),""),("حجم 24 ساعة",fmt(t.get("turnover24h")),"")]
+    for col,(a,b,c) in zip(cols,vals):
+        with col:tile(a,b,c)
+    if ratio:
+        cols=st.columns(2)
+        with cols[0]:tile("نسبة LONG",f'{float(ratio.get("buyRatio",0))*100:.1f}%')
+        with cols[1]:tile("نسبة SHORT",f'{float(ratio.get("sellRatio",0))*100:.1f}%')
+    else:st.caption("نسبة Long/Short غير متاحة حالياً.")
+except Exception as e:st.warning("تعذر تحميل بيانات العقود: "+str(e))
+st.caption("البيانات مجانية من Bybit؛ بعض الحقول قد لا تتوفر لكل عقد.")
+st.markdown("</div>",unsafe_allow_html=True)
+
+# Signal panel
+st.markdown('<div class="panel" dir="rtl">',unsafe_allow_html=True)
+st.subheader("🎯 إشارات الدخول والخروج")
+if sig:
+    side=sig["side"];label="LONG — شراء" if side=="LONG" else "SHORT — بيع" if side=="SHORT" else "WAIT — انتظار"
+    cls="up" if side=="LONG" else "down" if side=="SHORT" else "gold"
+    st.markdown(f'<h2 class="{cls}">{label}</h2>',unsafe_allow_html=True)
+    cols=st.columns(3)
+    for col,(a,b) in zip(cols,[("قوة التوافق",f'{sig["score"]}/100'),("تقييم LONG",f'{sig["long"]}/100'),("تقييم SHORT",f'{sig["short"]}/100')]):
+        with col:tile(a,b)
+    if side!="WAIT":
+        cols=st.columns(5);levels=[("الدخول",sig["entry"]),("وقف الخسارة",sig["stop"])]+[(f"TP{i+1}",v) for i,v in enumerate(sig["targets"])]
+        for col,(a,b) in zip(cols,levels):
+            with col:tile(a,fmt(b))
+    else:st.info("لا توجد إشارة قوية حالياً؛ الأفضل انتظار تأكيد بدلاً من الدخول القسري.")
+    st.caption("آخر شمعة مغلقة: "+sig["time"].strftime("%Y-%m-%d %H:%M UTC"))
+else:st.info("حمّل بيانات العملة لعرض الإشارة.")
+st.markdown("</div>",unsafe_allow_html=True)
+
+# Favorites
+st.markdown('<div class="panel" dir="rtl">',unsafe_allow_html=True)
+st.subheader("⭐ قائمة العملات المفضلة")
+if "favorites" not in st.session_state:st.session_state["favorites"]=["BTC","ETH","SOL"]
+a,b=st.columns([3,1])
+with a:fav=st.text_input("أضف عملة",placeholder="مثال XRP",key="fav_input")
+with b:
+    st.write("");st.write("")
+    if st.button("إضافة ⭐",use_container_width=True):
+        try:
+            z=base_symbol(fav)
+            if z not in st.session_state["favorites"]:st.session_state["favorites"].append(z)
+        except MarketError as e:st.error(str(e))
+favs=st.session_state["favorites"]
+if favs:
+    selected=st.selectbox("اختر عملة",favs)
+    if st.button("فتح تحليل العملة المختارة",use_container_width=True):
+        st.session_state["active_symbol"]=selected;st.rerun()
+    delete=st.selectbox("حذف عملة",["—"]+favs)
+    if delete!="—" and st.button("حذف من المفضلة"):
+        st.session_state["favorites"]=[z for z in favs if z!=delete];st.rerun()
+st.markdown("</div>",unsafe_allow_html=True)
+
+# Ranking
+st.markdown('<div class="panel" dir="rtl">',unsafe_allow_html=True)
+st.subheader("🏆 ترتيب العملات حسب قوة الإشارة")
+st.caption("يفحص العملات المفضلة والعملات الرئيسية على فريم 15 دقيقة.")
+if st.button("تحديث ترتيب العملات",use_container_width=True):
+    todo=list(dict.fromkeys(favs+POPULAR));rows=[];bar=st.progress(0)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        fs=[pool.submit(scan_one,z) for z in todo]
+        for i,f in enumerate(as_completed(fs),1):
+            rows.append(f.result());bar.progress(i/len(fs))
+    st.session_state["ranking"]=pd.DataFrame(rows).sort_values("قوة التوافق",ascending=False)
+if "ranking" in st.session_state:st.dataframe(st.session_state["ranking"],use_container_width=True,hide_index=True)
+st.markdown("</div>",unsafe_allow_html=True)
+
+st.markdown('<div class="muted" style="text-align:center;padding:15px" dir="rtl">GALEIC FUTURES PRO · نسخة مجانية · تحليل فقط دون تنفيذ صفقات<br>الإشارات تقديرية وليست ضماناً للربح. بيانات التصفية والخرائط الحرارية المتقدمة غير مشمولة.</div>',unsafe_allow_html=True)
